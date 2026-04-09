@@ -1,11 +1,12 @@
 import copy
 import os
-from collections import OrderedDict
 
 import numpy as np
+import torch
 
 import robosuite.utils.transform_utils as T
 from robosuite.controllers import controller_factory, load_controller_config
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.models.grippers import gripper_factory
 from robosuite.robots.manipulator import Manipulator
 from robosuite.utils.buffers import DeltaBuffer, RingBuffer
@@ -112,7 +113,7 @@ class SingleArm(Manipulator):
         #             NOTE: "type" must be one of: {JOINT_POSITION, JOINT_TORQUE, JOINT_VELOCITY,
         #                                           OSC_POSITION, OSC_POSE, IK_POSE}
         assert (
-            type(self.controller_config) == dict
+            isinstance(self.controller_config, dict)
         ), "Inputted controller config must be a dict! Instead, got type: {}".format(type(self.controller_config))
 
         # Add to the controller dict additional relevant params:
@@ -231,14 +232,16 @@ class SingleArm(Manipulator):
         """
 
         # clip actions into valid range
-        assert len(action) == self.action_dim, "environment got invalid action dimension -- expected {}, got {}".format(
-            self.action_dim, len(action)
+        batched = isinstance(action, torch.Tensor) and action.ndim == 2
+        action_dim = action.shape[-1] if batched else len(action)
+        assert action_dim == self.action_dim, "environment got invalid action dimension -- expected {}, got {}".format(
+            self.action_dim, action_dim
         )
 
         gripper_action = None
         if self.has_gripper:
-            gripper_action = action[self.controller.control_dim :]  # all indexes past controller dimension indexes
-            arm_action = action[: self.controller.control_dim]
+            gripper_action = action[..., self.controller.control_dim:]
+            arm_action = action[..., :self.controller.control_dim]
         else:
             arm_action = action
 
@@ -249,9 +252,18 @@ class SingleArm(Manipulator):
         # Now run the controller for a step
         torques = self.controller.run_controller()
 
-        # Clip the torques
+        # Clip the torques (replace NaN/inf with 0 first so a physics explosion in one
+        # warp env doesn't propagate NaN into the simulator and crash other envs).
         low, high = self.torque_limits
-        self.torques = np.clip(torques, low, high)
+        if isinstance(torques, torch.Tensor):
+            torques = torch.nan_to_num(torques, nan=0.0, posinf=0.0, neginf=0.0)
+            self.torques = torch.clamp(
+                torques,
+                torch.as_tensor(low, device=torques.device, dtype=torch.float32),
+                torch.as_tensor(high, device=torques.device, dtype=torch.float32),
+            )
+        else:
+            self.torques = np.clip(torques, low, high)
 
         # Get gripper action, if applicable
         if self.has_gripper:
@@ -266,17 +278,30 @@ class SingleArm(Manipulator):
             self.recent_qpos.push(self._joint_positions)
             self.recent_actions.push(action)
             self.recent_torques.push(self.torques)
-            self.recent_ee_forcetorques.push(np.concatenate((self.ee_force, self.ee_torque)))
-            self.recent_ee_pose.push(np.concatenate((self.controller.ee_pos, T.mat2quat(self.controller.ee_ori_mat))))
-            self.recent_ee_vel.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
 
-            # Estimation of eef acceleration (averaged derivative of recent velocities)
-            self.recent_ee_vel_buffer.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
-            diffs = np.vstack(
-                [self.recent_ee_acc.current, self.control_freq * np.diff(self.recent_ee_vel_buffer.buf, axis=0)]
-            )
-            ee_acc = np.array([np.convolve(col, np.ones(10) / 10.0, mode="valid")[0] for col in diffs.transpose()])
-            self.recent_ee_acc.push(ee_acc)
+            if isinstance(self.sim, MjSimWarp):
+                # Force/torque sensors and RingBuffer-based acc estimation are not
+                # supported for warp; update pose/vel buffers using torch ops instead.
+                self.recent_ee_pose.push(torch.cat(
+                    [self.controller.ee_pos, T.mat2quat_torch(self.controller.ee_ori_mat)], dim=-1
+                ))
+                self.recent_ee_vel.push(torch.cat(
+                    [self.controller.ee_pos_vel, self.controller.ee_ori_vel], dim=-1
+                ))
+            else:
+                self.recent_ee_forcetorques.push(np.concatenate((self.ee_force, self.ee_torque)))
+                self.recent_ee_pose.push(
+                    np.concatenate((self.controller.ee_pos, T.mat2quat(self.controller.ee_ori_mat)))
+                )
+                self.recent_ee_vel.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
+
+                # Estimation of eef acceleration (averaged derivative of recent velocities)
+                self.recent_ee_vel_buffer.push(np.concatenate((self.controller.ee_pos_vel, self.controller.ee_ori_vel)))
+                diffs = np.vstack(
+                    [self.recent_ee_acc.current, self.control_freq * np.diff(self.recent_ee_vel_buffer.buf, axis=0)]
+                )
+                ee_acc = np.array([np.convolve(col, np.ones(10) / 10.0, mode="valid")[0] for col in diffs.transpose()])
+                self.recent_ee_acc.push(ee_acc)
 
     def _visualize_grippers(self, visible):
         """
@@ -304,19 +329,22 @@ class SingleArm(Manipulator):
         # eef features
         @sensor(modality=modality)
         def eef_pos(obs_cache):
-            return np.array(self.sim.data.site_xpos[self.eef_site_id])
+            return self.sim.data.site_xpos[self.eef_site_id]
 
         @sensor(modality=modality)
         def eef_quat(obs_cache):
-            return T.convert_quat(self.sim.data.get_body_xquat(self.robot_model.eef_name), to="xyzw")
+            q = self.sim.data.get_body_xquat(self.robot_model.eef_name)
+            if isinstance(q, torch.Tensor):
+                return q[:, [1, 2, 3, 0]]  # wxyz → xyzw, (num_envs, 4)
+            return T.convert_quat(q, to="xyzw")
 
         @sensor(modality=modality)
         def eef_vel_lin(obs_cache):
-            return np.array(self.sim.data.get_body_xvelp(self.robot_model.eef_name))
+            return self.sim.data.get_body_xvelp(self.robot_model.eef_name)
 
         @sensor(modality=modality)
         def eef_vel_ang(obs_cache):
-            return np.array(self.sim.data.get_body_xvelr(self.robot_model.eef_name))
+            return self.sim.data.get_body_xvelr(self.robot_model.eef_name)
 
         sensors = [eef_pos, eef_quat, eef_vel_lin, eef_vel_ang]
         names = [f"{pf}eef_pos", f"{pf}eef_quat", f"{pf}eef_vel_lin", f"{pf}eef_vel_ang"]
@@ -328,11 +356,11 @@ class SingleArm(Manipulator):
 
             @sensor(modality=modality)
             def gripper_qpos(obs_cache):
-                return np.array([self.sim.data.qpos[x] for x in self._ref_gripper_joint_pos_indexes])
+                return self.sim.data.qpos[self._ref_gripper_joint_pos_indexes]
 
             @sensor(modality=modality)
             def gripper_qvel(obs_cache):
-                return np.array([self.sim.data.qvel[x] for x in self._ref_gripper_joint_vel_indexes])
+                return self.sim.data.qvel[self._ref_gripper_joint_vel_indexes]
 
             sensors += [gripper_qpos, gripper_qvel]
             names += [f"{pf}gripper_qpos", f"{pf}gripper_qvel"]
@@ -363,8 +391,15 @@ class SingleArm(Manipulator):
         # Action limits based on controller limits
         low, high = ([-1] * self.gripper.dof, [1] * self.gripper.dof) if self.has_gripper else ([], [])
         low_c, high_c = self.controller.control_limits
-        low = np.concatenate([low_c, low])
-        high = np.concatenate([high_c, high])
+        if isinstance(low_c, torch.Tensor):
+            dev, dtype = low_c.device, low_c.dtype
+            low_g = torch.tensor(low, device=dev, dtype=dtype)
+            high_g = torch.tensor(high, device=dev, dtype=dtype)
+            low = torch.cat([low_c, low_g])
+            high = torch.cat([high_c, high_g])
+        else:
+            low = np.concatenate([low_c, low])
+            high = np.concatenate([high_c, high])
 
         return low, high
 

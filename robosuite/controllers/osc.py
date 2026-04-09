@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import math
 
 import numpy as np
+import torch
 
 import robosuite.utils.transform_utils as T
 from robosuite.controllers.base_controller import Controller
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.control_utils import *
 
 # Supported impedance modes
@@ -199,7 +203,12 @@ class OperationalSpaceController(Controller):
         self.relative_ori = np.zeros(3)
         self.ori_ref = None
 
-    def set_goal(self, action, set_pos=None, set_ori=None):
+    def set_goal(
+        self,
+        action: np.ndarray | torch.Tensor,
+        set_pos: np.ndarray | None = None,
+        set_ori: np.ndarray | None = None,
+    ) -> None:
         """
         Sets goal based on input @action. If self.impedance_mode is not "fixed", then the input will be parsed into the
         delta values to update the goal position / pose and the kp and/or damping_ratio values to be immediately updated
@@ -216,7 +225,8 @@ class OperationalSpaceController(Controller):
             set_pos (Iterable): If set, overrides @action and sets the desired absolute eef position goal state
             set_ori (Iterable): IF set, overrides @action and sets the desired absolute eef orientation goal state
         """
-        # Update state
+        self.new_update = True
+        self._warp_opspace_valid = False  # invalidate per-step cache for warp substeps
         self.update()
 
         # Parse action based on the impedance mode, and update kp / kd as necessary
@@ -255,15 +265,50 @@ class OperationalSpaceController(Controller):
             scaled_delta = delta
 
         # We only want to update goal orientation if there is a valid delta ori value OR if we're using absolute ori
-        # use math.isclose instead of numpy because numpy is slow
-        bools = [0.0 if math.isclose(elem, 0.0) else 1.0 for elem in scaled_delta[3:]]
-        if sum(bools) > 0.0 or set_ori is not None:
-            self.goal_ori = set_goal_orientation(
-                scaled_delta[3:], self.ee_ori_mat, orientation_limit=self.orientation_limits, set_ori=set_ori
+        if isinstance(scaled_delta, torch.Tensor):
+            # Warp batched case: fully vectorized, stays on GPU.
+            dev, dtype = scaled_delta.device, scaled_delta.dtype
+
+            # ---- Position goal ----
+            if set_pos is not None:
+                self.goal_pos = torch.as_tensor(set_pos, device=dev, dtype=dtype).unsqueeze(0).expand(scaled_delta.shape[0], -1).clone()
+            else:
+                self.goal_pos = self.ee_pos + scaled_delta[:, :3]
+                if self.position_limits is not None:
+                    lo = torch.as_tensor(self.position_limits[0], device=dev, dtype=dtype)
+                    hi = torch.as_tensor(self.position_limits[1], device=dev, dtype=dtype)
+                    self.goal_pos = torch.clamp(self.goal_pos, lo, hi)
+
+            # ---- Orientation goal ----
+            if set_ori is not None:
+                self.goal_ori = torch.as_tensor(set_ori, device=dev, dtype=dtype).unsqueeze(0).expand(scaled_delta.shape[0], -1, -1).clone()
+            else:
+                ax_ang = scaled_delta[:, 3:]                          # (B, 3)
+                # Mask: per-env flag for whether the ori delta is non-zero.
+                nonzero_ori = (ax_ang.abs() > 0).any(dim=-1)          # (B,)
+                rot_err = T.quat2mat_torch(T.axisangle2quat_torch(ax_ang))  # (B, 3, 3)
+                new_goal_ori = rot_err @ self.ee_ori_mat               # (B, 3, 3) — updated goal
+                # For envs with zero delta, keep the previous goal (or fall back to current ee_ori).
+                if isinstance(self.goal_ori, torch.Tensor):
+                    prev_goal_ori = self.goal_ori
+                else:
+                    prev_goal_ori = torch.as_tensor(
+                        self.goal_ori if self.goal_ori is not None else self.ee_ori_mat.cpu().numpy(),
+                        device=dev, dtype=dtype,
+                    )
+                    if prev_goal_ori.dim() == 2:
+                        prev_goal_ori = prev_goal_ori.unsqueeze(0).expand(scaled_delta.shape[0], -1, -1)
+                self.goal_ori = torch.where(nonzero_ori[:, None, None], new_goal_ori, prev_goal_ori)
+        else:
+            # use math.isclose instead of numpy because numpy is slow
+            bools = [0.0 if math.isclose(elem, 0.0) else 1.0 for elem in scaled_delta[3:]]
+            if sum(bools) > 0.0 or set_ori is not None:
+                self.goal_ori = set_goal_orientation(
+                    scaled_delta[3:], self.ee_ori_mat, orientation_limit=self.orientation_limits, set_ori=set_ori
+                )
+            self.goal_pos = set_goal_position(
+                scaled_delta[:3], self.ee_pos, position_limit=self.position_limits, set_pos=set_pos
             )
-        self.goal_pos = set_goal_position(
-            scaled_delta[:3], self.ee_pos, position_limit=self.position_limits, set_pos=set_pos
-        )
 
         if self.interpolator_pos is not None:
             self.interpolator_pos.set_goal(self.goal_pos)
@@ -275,7 +320,7 @@ class OperationalSpaceController(Controller):
             )  # goal is the total orientation error
             self.relative_ori = np.zeros(3)  # relative orientation always starts at 0
 
-    def run_controller(self):
+    def run_controller(self) -> np.ndarray | torch.Tensor:
         """
         Calculates the torques required to reach the desired setpoint.
 
@@ -289,6 +334,9 @@ class OperationalSpaceController(Controller):
         """
         # Update state
         self.update()
+
+        if isinstance(self.sim, MjSimWarp):
+            return self._run_controller_warp()
 
         desired_pos = None
         # Only linear interpolator is currently supported
@@ -356,19 +404,86 @@ class OperationalSpaceController(Controller):
 
         return self.torques
 
+    def _run_controller_warp(self) -> torch.Tensor:
+        """Batched OSC torque computation for warp — stays entirely in torch on CUDA."""
+        dev = self.mass_matrix.device
+        dtype = self.mass_matrix.dtype
+
+        # Per-policy-step cache: opspace matrices and numpy→GPU conversions are
+        # recomputed only once per policy step (when Jacobians/mass matrix are fresh)
+        # and reused for all 25 substeps.  set_goal() sets _warp_opspace_valid=False
+        # so the first substep always recomputes.
+        if not getattr(self, '_warp_opspace_valid', False):
+            # Substep 1: state was just read by update() inside set_goal() after
+            # kinematics_forward() ran.  Cache goals, gains, and opspace matrices.
+            self._goal_pos_t = self.goal_pos if isinstance(self.goal_pos, torch.Tensor) \
+                else torch.as_tensor(self.goal_pos, device=dev, dtype=dtype)
+            self._goal_ori_t = self.goal_ori if isinstance(self.goal_ori, torch.Tensor) \
+                else torch.as_tensor(self.goal_ori, device=dev, dtype=dtype)
+            self._kp_t = torch.as_tensor(self.kp, device=dev, dtype=dtype)
+            self._kd_t = torch.as_tensor(self.kd, device=dev, dtype=dtype)
+            self._initial_joint_t = torch.as_tensor(self.initial_joint, device=dev, dtype=dtype)
+            # Opspace matrices depend only on Jacobians and mass matrix — both held
+            # constant for the full policy step — so compute once and cache.
+            self._lambda_full, self._lambda_pos, self._lambda_ori, self._nullspace_matrix = \
+                opspace_matrices_torch(self.mass_matrix, self.J_full, self.J_pos, self.J_ori)
+            self._J_full_t = self.J_full  # already a GPU tensor; store alias for clarity
+            self._warp_opspace_valid = True
+        else:
+            # Substeps 2-25: read fresh positions/velocities from warp data.
+            # kinematics_forward() has already run for this substep (in base.py's
+            # substep loop), so site_xpos / qpos / qvel are current.
+            self.partial_update_warp()
+
+        # Errors: (B, 3) — positions/velocities are fresh for this substep.
+        pos_error = self._goal_pos_t - self.ee_pos
+        ori_error = orientation_error_torch(self._goal_ori_t, self.ee_ori_mat)
+
+        # Desired force / torque: (B, 3)
+        desired_force = pos_error * self._kp_t[:3] - self.ee_pos_vel * self._kd_t[:3]
+        desired_torque = ori_error * self._kp_t[3:] - self.ee_ori_vel * self._kd_t[3:]
+
+        # Decoupled wrench: (B, 6)
+        if self.uncoupling:
+            decoupled_wrench = torch.cat(
+                [
+                    (self._lambda_pos @ desired_force.unsqueeze(-1)).squeeze(-1),
+                    (self._lambda_ori @ desired_torque.unsqueeze(-1)).squeeze(-1),
+                ],
+                dim=-1,
+            )
+        else:
+            wrench = torch.cat([desired_force, desired_torque], dim=-1)  # (B, 6)
+            decoupled_wrench = (self._lambda_full @ wrench.unsqueeze(-1)).squeeze(-1)
+
+        # Primary torques + gravity comp: (B, ndof)
+        torques = (self._J_full_t.mT @ decoupled_wrench.unsqueeze(-1)).squeeze(-1) + self.torque_compensation
+
+        # Nullspace torques: (B, ndof)
+        torques = torques + nullspace_torques_torch(
+            self.mass_matrix, self._nullspace_matrix, self._initial_joint_t, self.joint_pos, self.joint_vel
+        )
+
+        self.torques = torques
+        return self.torques
+
     def update_initial_joints(self, initial_joints):
         # First, update from the superclass method
         super().update_initial_joints(initial_joints)
 
-        # We also need to reset the goal in case the old goals were set to the initial confguration
+        # We also need to reset the goal in case the old goals were set to the initial configuration
         self.reset_goal()
 
-    def reset_goal(self):
+    def reset_goal(self) -> None:
         """
         Resets the goal to the current state of the robot
         """
-        self.goal_ori = np.array(self.ee_ori_mat)
-        self.goal_pos = np.array(self.ee_pos)
+        if isinstance(self.sim, MjSimWarp):
+            self.goal_ori = self.ee_ori_mat.cpu().numpy()  # (num_envs, 3, 3)
+            self.goal_pos = self.ee_pos.cpu().numpy()  # (num_envs, 3)
+        else:
+            self.goal_ori = np.array(self.ee_ori_mat)
+            self.goal_pos = np.array(self.ee_pos)
 
         # Also reset interpolators if required
 

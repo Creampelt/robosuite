@@ -1,6 +1,13 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from collections import OrderedDict
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import warp as wp
 
 import robosuite.utils.transform_utils as T
 from robosuite.environments.manipulation.two_arm_env import TwoArmEnv
@@ -177,6 +184,8 @@ class TwoArmHandover(TwoArmEnv):
         camera_segmentations=None,  # {None, instance, class, element}
         renderer="mujoco",
         renderer_config=None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # Task settings
         self.prehensile = prehensile
@@ -224,9 +233,11 @@ class TwoArmHandover(TwoArmEnv):
             camera_segmentations=camera_segmentations,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
-    def reward(self, action=None):
+    def reward(self, action: np.ndarray | wp.array = None) -> float:
         """
         Reward function for the task.
 
@@ -469,7 +480,18 @@ class TwoArmHandover(TwoArmEnv):
             for obj_pos, obj_quat, obj in object_placements.values():
                 # If prehensile, set the object normally
                 if self.prehensile:
-                    self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                    if self.use_warp:
+                        import warp as wp
+                        from robosuite.utils.binding_utils import MjSimWarp
+                        assert isinstance(self.sim, MjSimWarp)
+                        _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
+                        _val_batch = np.tile(_val, (self.num_envs, 1))
+                        self.sim.data.set_joint_qpos(
+                            obj.joints[0],
+                            wp.from_numpy(_val_batch, device=self.sim._warp_data.qpos.device),
+                        )
+                    else:
+                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
                 # Else, set the object in the hand of the robot and loop a few steps to guarantee the robot is grasping
                 #   the object initially
                 else:
@@ -477,9 +499,20 @@ class TwoArmHandover(TwoArmEnv):
                     obj_quat = T.quat_multiply(obj_quat, eef_rot_quat)
                     for j in range(100):
                         # Set object in hand
-                        self.sim.data.set_joint_qpos(
-                            obj.joints[0], np.concatenate([self._eef0_xpos, np.array(obj_quat)])
-                        )
+                        if self.use_warp:
+                            import warp as wp
+                            from robosuite.utils.binding_utils import MjSimWarp
+                            assert isinstance(self.sim, MjSimWarp)
+                            _val = np.array([*self._eef0_xpos, *obj_quat], dtype=np.float32)
+                            _val_batch = np.tile(_val, (self.num_envs, 1))
+                            self.sim.data.set_joint_qpos(
+                                obj.joints[0],
+                                wp.from_numpy(_val_batch, device=self.sim._warp_data.qpos.device),
+                            )
+                        else:
+                            self.sim.data.set_joint_qpos(
+                                obj.joints[0], np.concatenate([self._eef0_xpos, np.array(obj_quat)])
+                            )
                         # Close gripper (action = 1) and prevent arm from moving
                         if self.env_configuration == "bimanual":
                             # Execute no-op action with gravity compensation

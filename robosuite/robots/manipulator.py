@@ -22,13 +22,12 @@ class Manipulator(Robot):
             gripper_action (float): Value between [-1,1] to send to gripper
         """
         actuator_idxs = [self.sim.model.actuator_name2id(actuator) for actuator in gripper.actuators]
-        gripper_action_actual = gripper.format_action(gripper_action)
-        # rescale normalized gripper action to control ranges
         ctrl_range = self.sim.model.actuator_ctrlrange[actuator_idxs]
         bias = 0.5 * (ctrl_range[:, 1] + ctrl_range[:, 0])
         weight = 0.5 * (ctrl_range[:, 1] - ctrl_range[:, 0])
-        applied_gripper_action = bias + weight * gripper_action_actual
-        self.sim.data.ctrl[actuator_idxs] = applied_gripper_action
+
+        gripper_action_actual = gripper.format_action(gripper_action)
+        self.sim.data.ctrl[actuator_idxs] = bias + weight * gripper_action_actual
 
     def visualize(self, vis_settings):
         """
@@ -80,8 +79,8 @@ class Manipulator(Robot):
     def ee_force(self):
         """
         Returns:
-            np.array or dict: either single value or arm-specific entries specifying the force applied at the force sensor
-                at the robot arm's eef
+            np.array or dict: either single value or arm-specific entries specifying the force
+                applied at the force sensor at the robot arm's eef
         """
         raise NotImplementedError
 

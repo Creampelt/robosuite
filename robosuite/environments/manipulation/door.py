@@ -1,6 +1,13 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from collections import OrderedDict
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import warp as wp
 
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import TableArena
@@ -159,6 +166,8 @@ class Door(SingleArmEnv):
         camera_segmentations=None,  # {None, instance, class, element}
         renderer="mujoco",
         renderer_config=None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # settings for table top (hardcoded since it's not an essential part of the environment)
         self.table_full_size = (0.8, 0.3, 0.05)
@@ -200,9 +209,11 @@ class Door(SingleArmEnv):
             camera_segmentations=camera_segmentations,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
-    def reward(self, action=None):
+    def reward(self, action: np.ndarray | wp.array = None) -> float:
         """
         Reward function for the task.
 

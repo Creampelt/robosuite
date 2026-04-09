@@ -1,11 +1,21 @@
+from __future__ import annotations
+
 import numpy as np
+import torch
 
 import robosuite.utils.transform_utils as trans
 from robosuite.utils.numba import jit_decorator
 
 
 @jit_decorator
-def nullspace_torques(mass_matrix, nullspace_matrix, initial_joint, joint_pos, joint_vel, joint_kp=10):
+def nullspace_torques(
+    mass_matrix: np.ndarray,
+    nullspace_matrix: np.ndarray,
+    initial_joint: np.ndarray,
+    joint_pos: np.ndarray,
+    joint_vel: np.ndarray,
+    joint_kp: float = 10,
+) -> np.ndarray:
     """
     For a robot with redundant DOF(s), a nullspace exists which is orthogonal to the remainder of the controllable
     subspace of the robot's joints. Therefore, an additional secondary objective that does not impact the original
@@ -41,7 +51,12 @@ def nullspace_torques(mass_matrix, nullspace_matrix, initial_joint, joint_pos, j
 
 
 @jit_decorator
-def opspace_matrices(mass_matrix, J_full, J_pos, J_ori):
+def opspace_matrices(
+    mass_matrix: np.ndarray,
+    J_full: np.ndarray,
+    J_pos: np.ndarray,
+    J_ori: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Calculates the relevant matrices used in the operational space control algorithm
 
@@ -83,7 +98,7 @@ def opspace_matrices(mass_matrix, J_full, J_pos, J_ori):
 
 
 @jit_decorator
-def orientation_error(desired, current):
+def orientation_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
     """
     This function calculates a 3-dimensional orientation error vector for use in the
     impedance controller. It does this by computing the delta rotation between the
@@ -111,7 +126,12 @@ def orientation_error(desired, current):
     return error
 
 
-def set_goal_position(delta, current_position, position_limit=None, set_pos=None):
+def set_goal_position(
+    delta: np.ndarray,
+    current_position: np.ndarray,
+    position_limit: np.ndarray | None = None,
+    set_pos: np.ndarray | None = None,
+) -> np.ndarray:
     """
     Calculates and returns the desired goal position, clipping the result accordingly to @position_limits.
     @delta and @current_position must be specified if a relative goal is requested, else @set_pos must be
@@ -147,7 +167,12 @@ def set_goal_position(delta, current_position, position_limit=None, set_pos=None
     return goal_position
 
 
-def set_goal_orientation(delta, current_orientation, orientation_limit=None, set_ori=None):
+def set_goal_orientation(
+    delta: np.ndarray,
+    current_orientation: np.ndarray,
+    orientation_limit: np.ndarray | None = None,
+    set_ori: np.ndarray | None = None,
+) -> np.ndarray:
     """
     Calculates and returns the desired goal orientation, clipping the result accordingly to @orientation_limits.
     @delta and @current_orientation must be specified if a relative goal is requested, else @set_ori must be
@@ -234,3 +259,86 @@ def set_goal_orientation(delta, current_orientation, orientation_limit=None, set
         if limited:
             goal_orientation = trans.euler2mat(np.array([euler[0], euler[1], euler[2]]))
     return goal_orientation
+
+
+@torch.jit.script
+def opspace_matrices_torch(
+    mass_matrix: torch.Tensor,
+    J_full: torch.Tensor,
+    J_pos: torch.Tensor,
+    J_ori: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batched torch version of opspace_matrices.
+
+    Args:
+        mass_matrix: (B, ndof, ndof) — per-env mass matrix
+        J_full: (B, 6, ndof)
+        J_pos: (B, 3, ndof)
+        J_ori: (B, 3, ndof)
+
+    Returns:
+        lambda_full (B, 6, 6), lambda_pos (B, 3, 3), lambda_ori (B, 3, 3), nullspace_matrix (B, ndof, ndof)
+    """
+    # mass_matrix is (B, ndof, ndof) — per-env, so each env gets its own inertia tensor.
+    M_inv = torch.linalg.inv(mass_matrix)  # (B, ndof, ndof)
+
+    # rcond=1e-4 mirrors numpy's pinv rcond threshold and prevents NaN/inf when the
+    # Jacobian is near-singular (e.g. after a contact event with rapid joint movement).
+    lambda_full = torch.linalg.pinv(J_full @ M_inv @ J_full.mT, rcond=1e-4)   # (B, 6, 6)
+    lambda_pos  = torch.linalg.pinv(J_pos  @ M_inv @ J_pos.mT,  rcond=1e-4)   # (B, 3, 3)
+    lambda_ori  = torch.linalg.pinv(J_ori  @ M_inv @ J_ori.mT,  rcond=1e-4)   # (B, 3, 3)
+
+    Jbar = M_inv @ J_full.mT @ lambda_full                         # (B, ndof, 6)
+    n = J_full.shape[-1]
+    eye = torch.eye(n, device=J_full.device, dtype=J_full.dtype)
+    nullspace_matrix = eye - Jbar @ J_full                         # (B, ndof, ndof)
+
+    return lambda_full, lambda_pos, lambda_ori, nullspace_matrix
+
+
+@torch.jit.script
+def nullspace_torques_torch(
+    mass_matrix: torch.Tensor,
+    nullspace_matrix: torch.Tensor,
+    initial_joint: torch.Tensor,
+    joint_pos: torch.Tensor,
+    joint_vel: torch.Tensor,
+    joint_kp: float = 10.0,
+) -> torch.Tensor:
+    """Batched torch version of nullspace_torques.
+
+    Args:
+        mass_matrix: (ndof, ndof)
+        nullspace_matrix: (B, ndof, ndof)
+        initial_joint: (ndof,)
+        joint_pos: (B, ndof)
+        joint_vel: (B, ndof)
+        joint_kp: proportional gain
+
+    Returns:
+        (B, ndof)
+    """
+    joint_kv = (joint_kp ** 0.5) * 2
+    error = joint_kp * (initial_joint - joint_pos) - joint_kv * joint_vel  # (B, ndof)
+    pose_torques = (mass_matrix @ error.unsqueeze(-1)).squeeze(-1)          # (B, ndof)
+    return (nullspace_matrix.mT @ pose_torques.unsqueeze(-1)).squeeze(-1)   # (B, ndof)
+
+
+@torch.jit.script
+def orientation_error_torch(desired: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
+    """Batched torch version of orientation_error.
+
+    Args:
+        desired: (B, 3, 3)
+        current: (B, 3, 3)
+
+    Returns:
+        (B, 3)
+    """
+    rc1, rc2, rc3 = current[:, :, 0], current[:, :, 1], current[:, :, 2]
+    rd1, rd2, rd3 = desired[:, :, 0], desired[:, :, 1], desired[:, :, 2]
+    return 0.5 * (
+        torch.linalg.cross(rc1, rd1) +
+        torch.linalg.cross(rc2, rd2) +
+        torch.linalg.cross(rc3, rd3)
+    )

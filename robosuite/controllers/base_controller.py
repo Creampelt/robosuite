@@ -3,8 +3,10 @@ from collections.abc import Iterable
 
 import mujoco
 import numpy as np
+import torch
 
 import robosuite.macros as macros
+from robosuite.utils.binding_utils import MjSimWarp
 
 
 class Controller(object, metaclass=abc.ABCMeta):
@@ -88,9 +90,7 @@ class Controller(object, metaclass=abc.ABCMeta):
 
         # Initialize controller by updating internal state and setting the initial joint, pos, and ori
         self.update()
-        self.initial_joint = self.joint_pos
-        self.initial_ee_pos = self.ee_pos
-        self.initial_ee_ori_mat = self.ee_ori_mat
+        self.initial_joint, self.initial_ee_pos, self.initial_ee_ori_mat = self._extract_initial_state()
 
     @abc.abstractmethod
     def run_controller(self):
@@ -117,10 +117,23 @@ class Controller(object, metaclass=abc.ABCMeta):
             self.action_scale = abs(self.output_max - self.output_min) / abs(self.input_max - self.input_min)
             self.action_output_transform = (self.output_max + self.output_min) / 2.0
             self.action_input_transform = (self.input_max + self.input_min) / 2.0
-        action = np.clip(action, self.input_min, self.input_max)
-        transformed_action = (action - self.action_input_transform) * self.action_scale + self.action_output_transform
+            if isinstance(self.sim, MjSimWarp):
+                dev = torch.device("cuda")
+                self.input_min = torch.as_tensor(self.input_min, device=dev, dtype=torch.float32)
+                self.input_max = torch.as_tensor(self.input_max, device=dev, dtype=torch.float32)
+                self.action_scale = torch.as_tensor(self.action_scale, device=dev, dtype=torch.float32)
+                self.action_input_transform = torch.as_tensor(
+                    self.action_input_transform, device=dev, dtype=torch.float32
+                )
+                self.action_output_transform = torch.as_tensor(
+                    self.action_output_transform, device=dev, dtype=torch.float32
+                )
 
-        return transformed_action
+        if isinstance(action, torch.Tensor):
+            action = torch.clamp(action, self.input_min, self.input_max)
+        else:
+            action = np.clip(action, self.input_min, self.input_max)
+        return (action - self.action_input_transform) * self.action_scale + self.action_output_transform
 
     def update(self, force=False):
         """
@@ -136,29 +149,103 @@ class Controller(object, metaclass=abc.ABCMeta):
 
         # Only run update if self.new_update or force flag is set
         if self.new_update or force:
-            self.sim.forward()
+            # For warp, forward() is already called in the main step loop before _pre_action.
+            # Calling it again here would be a redundant GPU kernel launch.
+            if not isinstance(self.sim, MjSimWarp):
+                self.sim.forward()
 
-            self.ee_pos = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id(self.eef_name)])
-            self.ee_ori_mat = np.array(
-                self.sim.data.site_xmat[self.sim.model.site_name2id(self.eef_name)].reshape([3, 3])
-            )
-            self.ee_pos_vel = np.array(self.sim.data.get_site_xvelp(self.eef_name))
-            self.ee_ori_vel = np.array(self.sim.data.get_site_xvelr(self.eef_name))
+            if isinstance(self.sim, MjSimWarp):
+                import torch
 
-            self.joint_pos = np.array(self.sim.data.qpos[self.qpos_index])
-            self.joint_vel = np.array(self.sim.data.qvel[self.qvel_index])
+                # All state variables are CUDA torch.Tensors.
+                # Shapes mirror the batched (num_envs, ...) convention.
+                self.ee_pos = self.sim.data.get_site_xpos(self.eef_name)      # (num_envs, 3)
+                self.ee_ori_mat = self.sim.data.get_site_xmat(self.eef_name)  # (num_envs, 3, 3)
 
-            self.J_pos = np.array(self.sim.data.get_site_jacp(self.eef_name).reshape((3, -1))[:, self.qvel_index])
-            self.J_ori = np.array(self.sim.data.get_site_jacr(self.eef_name).reshape((3, -1))[:, self.qvel_index])
-            self.J_full = np.array(np.vstack([self.J_pos, self.J_ori]))
+                # qpos/qvel subsetted to this controller's DOFs, as CUDA torch.Tensors.
+                self.joint_pos = self.sim.data.qpos[self.qpos_index]  # (num_envs, ndof)
+                self.joint_vel = self.sim.data.qvel[self.qvel_index]  # (num_envs, ndof)
 
-            mass_matrix = np.ndarray(shape=(self.sim.model.nv, self.sim.model.nv), dtype=np.float64, order="C")
-            mujoco.mj_fullM(self.sim.model._model, mass_matrix, self.sim.data.qM)
-            mass_matrix = np.reshape(mass_matrix, (len(self.sim.data.qvel), len(self.sim.data.qvel)))
-            self.mass_matrix = mass_matrix[self.qvel_index, :][:, self.qvel_index]
+                # Jacobians: single kernel call returns both position and rotation Jacs.
+                # Cache full (all-nv) Jacobians so partial_update_warp() can compute
+                # velocities cheaply without re-launching the Jacobian kernel.
+                J_pos_full, J_ori_full = self.sim.data.get_site_jacs(self.eef_name)  # (B, 3, nv)
+                self._J_pos_full = J_pos_full  # (num_envs, 3, nv) — cached for velocity use
+                self._J_ori_full = J_ori_full  # (num_envs, 3, nv)
+                # Stacked (6, nv) Jacobian for single-bmm velocity computation in partial_update_warp().
+                self._J_vel = torch.cat([J_pos_full, J_ori_full], dim=1)  # (num_envs, 6, nv)
+                self.J_pos = J_pos_full[:, :, self.qvel_index]    # (num_envs, 3, ndof)
+                self.J_ori = J_ori_full[:, :, self.qvel_index]    # (num_envs, 3, ndof)
+                self.J_full = torch.cat([self.J_pos, self.J_ori], dim=1)  # (num_envs, 6, ndof)
+
+                # Velocities from Jacobians × qvel — one bmm using the stacked Jacobian.
+                qvel_full = self.sim.data.qvel.tensor              # (num_envs, nv)
+                vel_both = torch.bmm(self._J_vel, qvel_full.unsqueeze(-1)).squeeze(-1)  # (B, 6)
+                self.ee_pos_vel = vel_both[:, :3]                  # (B, 3)
+                self.ee_ori_vel = vel_both[:, 3:]                  # (B, 3)
+
+                # Mass matrix: read directly from the dense GPU tensor — no CPU round-trip.
+                # sim.data.qM has shape (num_envs, padded_nv, padded_nv); the top-left
+                # nv × nv block is the full symmetric mass matrix (already expanded).
+                nv = self.sim.model.nv
+                qM_full = self.sim.data.qM  # (num_envs, padded_nv, padded_nv)
+                # Per-env mass matrix, subsetted to this controller's DOFs.
+                # Using per-env (not just env 0) is essential: the mass matrix depends on
+                # joint configuration, and using env 0's matrix for other envs produces
+                # wrong torques that destabilise environments with different configs.
+                mm_sub = qM_full[:, :nv, :nv][:, self.qvel_index, :][:, :, self.qvel_index]
+                self.mass_matrix = mm_sub.float()  # (num_envs, ndof, ndof)
+            else:
+                self.ee_pos = np.array(self.sim.data.site_xpos[self.sim.model.site_name2id(self.eef_name)])
+                self.ee_ori_mat = np.array(
+                    self.sim.data.site_xmat[self.sim.model.site_name2id(self.eef_name)].reshape([3, 3])
+                )
+                self.ee_pos_vel = np.array(self.sim.data.get_site_xvelp(self.eef_name))
+                self.ee_ori_vel = np.array(self.sim.data.get_site_xvelr(self.eef_name))
+
+                self.joint_pos = np.array(self.sim.data.qpos[self.qpos_index])
+                self.joint_vel = np.array(self.sim.data.qvel[self.qvel_index])
+
+                self.J_pos = np.array(
+                    self.sim.data.get_site_jacp(self.eef_name).reshape((3, -1))[:, self.qvel_index]
+                )
+                self.J_ori = np.array(
+                    self.sim.data.get_site_jacr(self.eef_name).reshape((3, -1))[:, self.qvel_index]
+                )
+                self.J_full = np.array(np.vstack([self.J_pos, self.J_ori]))
+
+                mass_matrix = np.ndarray(shape=(self.sim.model.nv, self.sim.model.nv), dtype=np.float64, order="C")
+                mujoco.mj_fullM(self.sim.model._model, mass_matrix, self.sim.data.qM)
+                mass_matrix = np.reshape(mass_matrix, (len(self.sim.data.qvel), len(self.sim.data.qvel)))
+                self.mass_matrix = mass_matrix[self.qvel_index, :][:, self.qvel_index]
 
             # Clear self.new_update
             self.new_update = False
+
+    def partial_update_warp(self):
+        """
+        Cheap per-substep state refresh for warp: updates positions, orientations,
+        and velocities without re-launching the Jacobian kernel.
+
+        Velocities are computed as ``J_cached @ qvel_fresh`` using the full Jacobians
+        cached by the last ``update()`` call.  Jacobians and mass matrix are kept
+        from the beginning of the policy step; they change slowly enough at 500 Hz
+        that this approximation is accurate.
+
+        Only called from :meth:`OSCController._run_controller_warp` on substeps 2–25.
+        """
+        import torch
+
+        data = self.sim.data
+        self.ee_pos = data.get_site_xpos(self.eef_name)         # (B, 3)
+        self.ee_ori_mat = data.get_site_xmat(self.eef_name)     # (B, 3, 3)
+        self.joint_pos = data.qpos[self.qpos_index]             # (B, ndof)
+        qvel_full = data.qvel.tensor                            # (B, nv)
+        self.joint_vel = qvel_full[:, self.qvel_index]          # (B, ndof)
+        # Velocities: single bmm with the stacked (6, nv) Jacobian cached by update().
+        vel_both = torch.bmm(self._J_vel, qvel_full.unsqueeze(-1)).squeeze(-1)  # (B, 6)
+        self.ee_pos_vel = vel_both[:, :3]                       # (B, 3)
+        self.ee_ori_vel = vel_both[:, 3:]                       # (B, 3)
 
     def update_base_pose(self, base_pos, base_ori):
         """
@@ -184,8 +271,26 @@ class Controller(object, metaclass=abc.ABCMeta):
         """
         self.initial_joint = np.array(initial_joints)
         self.update(force=True)
-        self.initial_ee_pos = self.ee_pos
-        self.initial_ee_ori_mat = self.ee_ori_mat
+        _, self.initial_ee_pos, self.initial_ee_ori_mat = self._extract_initial_state()
+
+    def _extract_initial_state(self):
+        """
+        Extract ``(initial_joint, initial_ee_pos, initial_ee_ori_mat)`` as plain
+        numpy arrays suitable for use as controller goals.
+
+        For standard sims these are just the current state attributes.  For
+        :class:`MjSimWarp` the attributes are batched warp arrays, so we pull
+        env 0 to CPU.
+        """
+        if isinstance(self.sim, MjSimWarp):
+            joint = self.joint_pos[0, self.qpos_index].cpu().numpy()
+            ee_pos = self.ee_pos[0].cpu().numpy()
+            ee_ori_mat = self.ee_ori_mat[0].cpu().numpy()
+        else:
+            joint = self.joint_pos
+            ee_pos = self.ee_pos
+            ee_ori_mat = self.ee_ori_mat
+        return joint, ee_pos, ee_ori_mat
 
     def clip_torques(self, torques):
         """
@@ -232,7 +337,7 @@ class Controller(object, metaclass=abc.ABCMeta):
         Gravity compensation for this robot arm
 
         Returns:
-            np.array: torques
+            np.array or torch.Tensor: torques, shape ``(num_envs, ndof)`` for warp
         """
         return self.sim.data.qfrc_bias[self.qvel_index]
 

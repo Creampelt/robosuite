@@ -1,4 +1,11 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+if TYPE_CHECKING:
+    import warp as wp
 
 from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
 from robosuite.robots import SingleArm

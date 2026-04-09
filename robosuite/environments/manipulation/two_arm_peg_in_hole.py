@@ -1,4 +1,11 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+if TYPE_CHECKING:
+    import warp as wp
 
 import robosuite.utils.transform_utils as T
 from robosuite.environments.manipulation.two_arm_env import TwoArmEnv
@@ -168,6 +175,8 @@ class TwoArmPegInHole(TwoArmEnv):
         camera_segmentations=None,  # {None, instance, class, element}
         renderer="mujoco",
         renderer_config=None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # Assert that the gripper type is None
         assert gripper_types is None, "Tried to specify gripper other than None in TwoArmPegInHole environment!"
@@ -208,9 +217,11 @@ class TwoArmPegInHole(TwoArmEnv):
             camera_segmentations=camera_segmentations,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
-    def reward(self, action=None):
+    def reward(self, action: np.ndarray | wp.array = None) -> float:
         """
         Reward function for the task.
 

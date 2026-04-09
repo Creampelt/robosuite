@@ -115,9 +115,16 @@ class DeltaBuffer(Buffer):
         Pushes a new value into the buffer; current becomes last and @value becomes current
 
         Args:
-            value (int or float or array): Value(s) to push into the array (taken as a single new element)
+            value (int or float or array or torch.Tensor): Value(s) to push into the array
         """
         self.last = self.current
+        try:
+            import torch
+            if isinstance(value, torch.Tensor):
+                self.current = value
+                return
+        except ImportError:
+            pass
         self.current = np.array(value)
 
     def clear(self):

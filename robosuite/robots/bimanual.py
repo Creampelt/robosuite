@@ -8,6 +8,7 @@ import robosuite.utils.transform_utils as T
 from robosuite.controllers import controller_factory, load_controller_config
 from robosuite.models.grippers import gripper_factory
 from robosuite.robots.manipulator import Manipulator
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.buffers import DeltaBuffer, RingBuffer
 from robosuite.utils.observables import Observable, sensor
 
@@ -208,7 +209,10 @@ class Bimanual(Manipulator):
             # Now, reset the grippers if necessary
             if self.has_gripper[arm]:
                 if not deterministic:
-                    self.sim.data.qpos[self._ref_gripper_joint_pos_indexes[arm]] = self.gripper[arm].init_qpos
+                    if isinstance(self.sim, MjSimWarp):
+                        self.sim.data.set_qpos_indexed(self._ref_gripper_joint_pos_indexes[arm], self.gripper[arm].init_qpos)
+                    else:
+                        self.sim.data.qpos[self._ref_gripper_joint_pos_indexes[arm]] = self.gripper[arm].init_qpos
 
                 self.gripper[arm].current_action = np.zeros(self.gripper[arm].dof)
 
@@ -394,10 +398,15 @@ class Bimanual(Manipulator):
         # eef features
         @sensor(modality=modality)
         def eef_pos(obs_cache):
+            if isinstance(self.sim, MjSimWarp):
+                return self.sim.data.site_xpos[self.eef_site_id[arm]]  # (num_envs, 3) torch.Tensor
             return np.array(self.sim.data.site_xpos[self.eef_site_id[arm]])
 
         @sensor(modality=modality)
         def eef_quat(obs_cache):
+            if isinstance(self.sim, MjSimWarp):
+                q = self.sim.data.get_body_xquat(self.robot_model.eef_name[arm])  # (num_envs, 4) wxyz torch.Tensor
+                return q[:, [1, 2, 3, 0]]  # (num_envs, 4) xyzw torch.Tensor
             return T.convert_quat(self.sim.data.get_body_xquat(self.robot_model.eef_name[arm]), to="xyzw")
 
         sensors = [eef_pos, eef_quat]
@@ -408,11 +417,11 @@ class Bimanual(Manipulator):
 
             @sensor(modality=modality)
             def gripper_qpos(obs_cache):
-                return np.array([self.sim.data.qpos[x] for x in self._ref_gripper_joint_pos_indexes[arm]])
+                return self.sim.data.qpos[self._ref_gripper_joint_pos_indexes[arm]]
 
             @sensor(modality=modality)
             def gripper_qvel(obs_cache):
-                return np.array([self.sim.data.qvel[x] for x in self._ref_gripper_joint_vel_indexes[arm]])
+                return self.sim.data.qvel[self._ref_gripper_joint_vel_indexes[arm]]
 
             sensors += [gripper_qpos, gripper_qvel]
             names += [f"{pf}{arm}_gripper_qpos", f"{pf}{arm}_gripper_qvel"]

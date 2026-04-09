@@ -1,12 +1,13 @@
 from collections import OrderedDict
 
 import numpy as np
+import torch
 
 import robosuite.macros as macros
 import robosuite.utils.transform_utils as T
 from robosuite.models.mounts import mount_factory
 from robosuite.models.robots import create_robot
-from robosuite.utils.binding_utils import MjSim
+from robosuite.utils.binding_utils import MjSim, MjSimWarp
 from robosuite.utils.buffers import DeltaBuffer
 from robosuite.utils.observables import Observable, sensor
 
@@ -144,8 +145,12 @@ class Robot(object):
         self._load_controller()
 
         # Update base pos / ori references
-        self.base_pos = self.sim.data.get_body_xpos(self.robot_model.root_body)
-        self.base_ori = T.mat2quat(self.sim.data.get_body_xmat(self.robot_model.root_body).reshape((3, 3)))
+        if isinstance(self.sim, MjSimWarp):
+            self.base_pos = self.sim.data.get_body_xpos(self.robot_model.root_body)[0].cpu().numpy()
+            self.base_ori = T.mat2quat(self.sim.data.get_body_xmat(self.robot_model.root_body)[0].cpu().numpy())
+        else:
+            self.base_pos = self.sim.data.get_body_xpos(self.robot_model.root_body)
+            self.base_ori = T.mat2quat(self.sim.data.get_body_xmat(self.robot_model.root_body).reshape((3, 3)))
 
         # Setup buffers to hold recent values
         self.recent_qpos = DeltaBuffer(dim=len(self.joint_indexes))
@@ -184,19 +189,37 @@ class Robot(object):
         # proprioceptive features
         @sensor(modality=modality)
         def joint_pos(obs_cache):
-            return np.array([self.sim.data.qpos[x] for x in self._ref_joint_pos_indexes])
+            return self.sim.data.qpos[self._ref_joint_pos_indexes]
 
         @sensor(modality=modality)
         def joint_pos_cos(obs_cache):
-            return np.cos(obs_cache[pre_compute]) if pre_compute in obs_cache else np.zeros(self.robot_model.dof)
+            if pre_compute not in obs_cache:
+                return np.zeros(self.robot_model.dof)
+            val = obs_cache[pre_compute]
+            try:
+                import torch
+                if isinstance(val, torch.Tensor):
+                    return torch.cos(val)
+            except ImportError:
+                pass
+            return np.cos(val)
 
         @sensor(modality=modality)
         def joint_pos_sin(obs_cache):
-            return np.sin(obs_cache[pre_compute]) if pre_compute in obs_cache else np.zeros(self.robot_model.dof)
+            if pre_compute not in obs_cache:
+                return np.zeros(self.robot_model.dof)
+            val = obs_cache[pre_compute]
+            try:
+                import torch
+                if isinstance(val, torch.Tensor):
+                    return torch.sin(val)
+            except ImportError:
+                pass
+            return np.sin(val)
 
         @sensor(modality=modality)
         def joint_vel(obs_cache):
-            return np.array([self.sim.data.qvel[x] for x in self._ref_joint_vel_indexes])
+            return self.sim.data.qvel[self._ref_joint_vel_indexes]
 
         sensors = [joint_pos, joint_pos_cos, joint_pos_sin, joint_vel]
         names = ["joint_pos", "joint_pos_cos", "joint_pos_sin", "joint_vel"]
@@ -346,7 +369,8 @@ class Robot(object):
         # In that case the amount of power scales proportional to the torque and the energy is the
         # time integral of that
         # Note that we use mean torque
-        return np.abs((1.0 / self.control_freq) * self.recent_torques.average)
+        val = (1.0 / self.control_freq) * self.recent_torques.average
+        return torch.abs(val) if isinstance(val, torch.Tensor) else np.abs(val)
 
     @property
     def _joint_positions(self):

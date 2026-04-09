@@ -1,6 +1,17 @@
 import numpy as np
 
 
+def _coerce_obs(value):
+    """Convert *value* to numpy unless it is already a torch.Tensor (preserves CUDA tensors)."""
+    try:
+        import torch
+        if isinstance(value, torch.Tensor):
+            return value
+    except ImportError:
+        pass
+    return np.array(value)
+
+
 def sensor(modality):
     """
     Decorator that should be added to any sensors that will be an observable.
@@ -231,10 +242,10 @@ class Observable:
                 not self._sampled and self._sampling_timestep - self._current_delay >= self._time_since_last_sample
             ) or force:
                 # Get newest raw value, corrupt it, filter it, and set it as our current observed value
-                obs = np.array(self._filter(self._corrupter(self._sensor(obs_cache))))
+                obs = _coerce_obs(self._filter(self._corrupter(self._sensor(obs_cache))))
                 self._current_observed_value = obs[0] if len(obs.shape) == 1 and obs.shape[0] == 1 else obs
                 # Update cache entry as well
-                obs_cache[self.name] = np.array(self._current_observed_value)
+                obs_cache[self.name] = _coerce_obs(self._current_observed_value)
                 # Toggle sampled and re-sample next time delay
                 self._sampled = True
                 self._current_delay = self._delayer()
@@ -249,10 +260,10 @@ class Observable:
                         f"Please adjust one (or both)"
                     )
                     # Get newest raw value, corrupt it, filter it, and set it as our current observed value
-                    obs = np.array(self._filter(self._corrupter(self._sensor(obs_cache))))
+                    obs = _coerce_obs(self._filter(self._corrupter(self._sensor(obs_cache))))
                     self._current_observed_value = obs[0] if len(obs.shape) == 1 and obs.shape[0] == 1 else obs
                     # Update cache entry as well
-                    obs_cache[self.name] = np.array(self._current_observed_value)
+                    obs_cache[self.name] = _coerce_obs(self._current_observed_value)
                     # Re-sample next time delay
                     self._current_delay = self._delayer()
                 self._time_since_last_sample %= self._sampling_timestep
@@ -374,7 +385,8 @@ class Observable:
         """
         try:
             _ = self.modality
-            self._data_shape = np.array(self._sensor({})).shape
+            sensor_output = _coerce_obs(self._sensor({}))
+            self._data_shape = sensor_output.shape
             self._is_number = len(self._data_shape) == 1 and self._data_shape[0] == 1
         except Exception as e:
             from robosuite.utils.log_utils import ROBOSUITE_DEFAULT_LOGGER

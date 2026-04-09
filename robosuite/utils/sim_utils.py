@@ -2,7 +2,58 @@
 Collection of useful simulation utilities
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+
 from robosuite.models.base import MujocoModel
+
+if TYPE_CHECKING:
+    import warp as wp
+
+
+def np_to_warp(np_arr: np.ndarray, template: "wp.array") -> "wp.array":
+    """
+    Convert a numpy array into a warp array whose dtype and device match *template*.
+
+    Args:
+        np_arr: Source numpy array (will be cast to float32 before conversion).
+        template: A ``wp.array`` whose ``.dtype`` and ``.device`` are used as the
+                  conversion target.
+
+    Returns:
+        wp.array: A new warp array on the same device as *template* with the same
+                  element dtype.
+
+    Raises:
+        TypeError: If *template*'s element dtype is not one of the supported warp
+                   structured types.
+    """
+    import warp as wp
+
+    dtype = template.dtype
+    device = template.device
+    shape = template.shape
+    src = np.asarray(np_arr, dtype=np.float32)
+    dtype_name: str = dtype.__name__ if hasattr(dtype, "__name__") else str(dtype)
+    if dtype_name == "float32":
+        return wp.from_numpy(src, device=device)
+    elif dtype_name in ("vec2f", "vec2"):
+        return wp.from_numpy(src.reshape(*shape, 2), dtype=dtype, device=device)
+    elif dtype_name in ("vec3f", "vec3"):
+        return wp.from_numpy(src.reshape(*shape, 3), dtype=dtype, device=device)
+    elif dtype_name in ("vec4f", "vec4"):
+        return wp.from_numpy(src.reshape(*shape, 4), dtype=dtype, device=device)
+    elif dtype_name in ("quatf", "quat"):
+        return wp.from_numpy(src.reshape(*shape, 4), dtype=dtype, device=device)
+    elif dtype_name in ("mat33f", "mat33"):
+        return wp.from_numpy(src.reshape(*shape, 3, 3), dtype=dtype, device=device)
+    elif dtype_name in ("spatial_vectorf", "spatial_vector"):
+        return wp.from_numpy(src.reshape(*shape, 6), dtype=dtype, device=device)
+    else:
+        raise TypeError(f"Unsupported warp element dtype for conversion: {dtype_name!r}")
 
 
 def check_contact(sim, geoms_1, geoms_2=None):

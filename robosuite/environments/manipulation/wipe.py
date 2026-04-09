@@ -1,7 +1,14 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import multiprocessing
 from collections import OrderedDict
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import warp as wp
 
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import WipeArena
@@ -189,6 +196,8 @@ class Wipe(SingleArmEnv):
         task_config=None,
         renderer="mujoco",
         renderer_config=None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # Assert that the gripper type is None
         assert (
@@ -289,9 +298,11 @@ class Wipe(SingleArmEnv):
             camera_segmentations=camera_segmentations,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
-    def reward(self, action=None):
+    def reward(self, action: np.ndarray | wp.array = None) -> float:
         """
         Reward function for the task.
 

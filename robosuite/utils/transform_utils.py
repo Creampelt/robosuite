@@ -927,3 +927,136 @@ def matrix_inverse(matrix):
         np.array: 2d-array representing the matrix inverse
     """
     return np.linalg.inv(matrix)
+
+
+# ---------------------------------------------------------------------------
+# Batched torch pose utilities (for MuJoCo Warp / GPU paths)
+# All functions operate on CUDA torch tensors with a leading batch dimension.
+# Quaternion convention: xyzw (same as the rest of this file).
+# ---------------------------------------------------------------------------
+
+
+def quat2mat_torch(q: "torch.Tensor") -> "torch.Tensor":
+    """Batched xyzw quaternion → rotation matrix.
+
+    Args:
+        q: ``(N, 4)`` float tensor, xyzw convention.
+
+    Returns:
+        ``(N, 3, 3)`` rotation matrix tensor.
+    """
+    import torch
+    x, y, z, w = q.unbind(-1)
+    return torch.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w),
+        2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+        2 * (x * z - y * w),     2 * (y * z + x * w),      1 - 2 * (x * x + y * y),
+    ], dim=-1).reshape(*q.shape[:-1], 3, 3)
+
+
+def mat2quat_torch(R: "torch.Tensor") -> "torch.Tensor":
+    """Batched rotation matrix → xyzw quaternion (vectorised Shepperd's method).
+
+    Args:
+        R: ``(N, 3, 3)`` rotation matrix tensor.
+
+    Returns:
+        ``(N, 4)`` quaternion tensor, xyzw convention.
+    """
+    import torch
+    m00, m01, m02 = R[..., 0, 0], R[..., 0, 1], R[..., 0, 2]
+    m10, m11, m12 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
+    m20, m21, m22 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
+    trace = m00 + m11 + m22
+
+    # Compute all 4 branches; select per-element. Sqrt inputs are clamped to
+    # avoid NaN in inactive branches.
+    s0 = 0.5 / torch.sqrt(torch.clamp(trace + 1.0, min=1e-10))
+    q0 = torch.stack([(m21 - m12) * s0, (m02 - m20) * s0, (m10 - m01) * s0, 0.25 / s0], dim=-1)
+
+    s1 = 2.0 * torch.sqrt(torch.clamp(1.0 + m00 - m11 - m22, min=1e-10))
+    q1 = torch.stack([0.25 * s1, (m01 + m10) / s1, (m02 + m20) / s1, (m21 - m12) / s1], dim=-1)
+
+    s2 = 2.0 * torch.sqrt(torch.clamp(1.0 + m11 - m00 - m22, min=1e-10))
+    q2 = torch.stack([(m01 + m10) / s2, 0.25 * s2, (m12 + m21) / s2, (m02 - m20) / s2], dim=-1)
+
+    s3 = 2.0 * torch.sqrt(torch.clamp(1.0 + m22 - m00 - m11, min=1e-10))
+    q3 = torch.stack([(m02 + m20) / s3, (m12 + m21) / s3, 0.25 * s3, (m10 - m01) / s3], dim=-1)
+
+    not_c0 = ~(trace > 0)
+    m00_largest = not_c0 & (m00 >= m11) & (m00 >= m22)
+    m11_largest = not_c0 & ~m00_largest & (m11 >= m22)
+    c0 = (trace > 0)[..., None]
+    c1 = m00_largest[..., None]
+    c2 = m11_largest[..., None]
+    return torch.where(c0, q0, torch.where(c1, q1, torch.where(c2, q2, q3)))
+
+
+def make_pose_torch(pos: "torch.Tensor", rot: "torch.Tensor") -> "torch.Tensor":
+    """Assemble a batched SE(3) homogeneous matrix from position and rotation.
+
+    Args:
+        pos: ``(N, 3)`` translation tensor.
+        rot: ``(N, 3, 3)`` rotation matrix tensor.
+
+    Returns:
+        ``(N, 4, 4)`` homogeneous transform tensor.
+    """
+    import torch
+    N = pos.shape[0]
+    mat = torch.eye(4, device=pos.device, dtype=pos.dtype).unsqueeze(0).expand(N, -1, -1).clone()
+    mat[:, :3, :3] = rot
+    mat[:, :3, 3] = pos
+    return mat
+
+
+def pose2mat_torch(pos: "torch.Tensor", quat_xyzw: "torch.Tensor") -> "torch.Tensor":
+    """Batched (pos, quat) → 4×4 SE(3) matrix.
+
+    Args:
+        pos: ``(N, 3)`` translation tensor.
+        quat_xyzw: ``(N, 4)`` quaternion tensor, xyzw convention.
+
+    Returns:
+        ``(N, 4, 4)`` homogeneous transform tensor.
+    """
+    return make_pose_torch(pos, quat2mat_torch(quat_xyzw))
+
+
+def pose_inv_torch(mat: "torch.Tensor") -> "torch.Tensor":
+    """Batched SE(3) matrix inverse.
+
+    For a rigid-body transform ``[[R, t], [0, 1]]`` the inverse is
+    ``[[R^T, -R^T @ t], [0, 1]]``.
+
+    Args:
+        mat: ``(N, 4, 4)`` SE(3) transform tensor.
+
+    Returns:
+        ``(N, 4, 4)`` inverse transform tensor.
+    """
+    R = mat[:, :3, :3]
+    t = mat[:, :3, 3]
+    R_T = R.mT
+    return make_pose_torch(-(R_T @ t.unsqueeze(-1)).squeeze(-1), R_T)
+
+
+def axisangle2quat_torch(vec: "torch.Tensor") -> "torch.Tensor":
+    """Batched axis-angle → quaternion (xyzw convention).
+
+    Args:
+        vec: ``(N, 3)`` axis-angle tensor where ``||vec||`` is the rotation angle.
+
+    Returns:
+        ``(N, 4)`` unit quaternion tensor, xyzw convention.
+    """
+    import torch
+    angle = torch.norm(vec, dim=-1, keepdim=True)          # (N, 1)
+    safe_angle = torch.where(angle > 1e-9, angle, torch.ones_like(angle))
+    axis = vec / safe_angle                                  # (N, 3)
+    half = angle / 2.0
+    quat = torch.cat([axis * torch.sin(half), torch.cos(half)], dim=-1)  # (N, 4) xyzw
+    # When angle ≈ 0 return identity quaternion (0, 0, 0, 1)
+    identity = torch.zeros_like(quat)
+    identity[..., -1] = 1.0
+    return torch.where(angle.expand_as(quat) > 1e-9, quat, identity)

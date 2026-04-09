@@ -1,7 +1,15 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from collections import OrderedDict
 from copy import deepcopy
 
 import numpy as np
+import torch
+
+if TYPE_CHECKING:
+    import warp as wp
 
 import robosuite.macros as macros
 from robosuite.controllers import reset_controllers
@@ -142,6 +150,8 @@ class RobotEnv(MujocoEnv):
         robot_configs=None,
         renderer="mujoco",
         renderer_config=None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # First, verify that correct number of robots are being inputted
         self.env_configuration = env_configuration
@@ -224,6 +234,8 @@ class RobotEnv(MujocoEnv):
             hard_reset=hard_reset,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
     def visualize(self, vis_settings):
@@ -572,14 +584,17 @@ class RobotEnv(MujocoEnv):
             AssertionError: [Invalid action dimension]
         """
         # Verify that the action is the correct dimension
-        assert len(action) == self.action_dim, "environment got invalid action dimension -- expected {}, got {}".format(
-            self.action_dim, len(action)
+        # For warp (batched) actions the shape is (num_envs, action_dim); use the last dim.
+        batched = isinstance(action, torch.Tensor) and action.ndim == 2
+        action_dim = action.shape[-1] if batched else len(action)
+        assert action_dim == self.action_dim, "environment got invalid action dimension -- expected {}, got {}".format(
+            self.action_dim, action_dim
         )
 
         # Update robot joints based on controller actions
         cutoff = 0
         for idx, robot in enumerate(self.robots):
-            robot_action = action[cutoff : cutoff + robot.action_dim]
+            robot_action = action[:, cutoff : cutoff + robot.action_dim] if batched else action[cutoff : cutoff + robot.action_dim]
             robot.control(robot_action, policy_step=policy_step)
             cutoff += robot.action_dim
 

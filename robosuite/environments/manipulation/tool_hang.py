@@ -1,6 +1,13 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from collections import OrderedDict
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import warp as wp
 
 import robosuite.utils.transform_utils as T
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
@@ -160,6 +167,8 @@ class ToolHang(SingleArmEnv):
         camera_segmentations=None,  # {None, instance, class, element}
         renderer="mujoco",
         renderer_config=None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # settings for table top
         self.table_full_size = table_full_size
@@ -198,9 +207,11 @@ class ToolHang(SingleArmEnv):
             camera_segmentations=camera_segmentations,
             renderer=renderer,
             renderer_config=renderer_config,
+            use_warp=use_warp,
+            num_envs=num_envs,
         )
 
-    def reward(self, action=None):
+    def reward(self, action: np.ndarray | wp.array = None) -> float:
         """
         Reward function for the task.
 
@@ -575,7 +586,18 @@ class ToolHang(SingleArmEnv):
 
             # Loop through all objects and reset their positions
             for obj_pos, obj_quat, obj in object_placements.values():
-                self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                if self.use_warp:
+                    import warp as wp
+                    from robosuite.utils.binding_utils import MjSimWarp
+                    assert isinstance(self.sim, MjSimWarp)
+                    _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
+                    _val_batch = np.tile(_val, (self.num_envs, 1))
+                    self.sim.data.set_joint_qpos(
+                        obj.joints[0],
+                        wp.from_numpy(_val_batch, device=self.sim._warp_data.qpos.device),
+                    )
+                else:
+                    self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
     def visualize(self, vis_settings):
         """

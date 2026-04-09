@@ -1,33 +1,44 @@
+from __future__ import annotations
+
 import os
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
+import torch
+
+if TYPE_CHECKING:
+    import warp as wp
 
 import robosuite
 import robosuite.macros as macros
 import robosuite.utils.sim_utils as SU
 from robosuite.renderers.base import load_renderer_config
-from robosuite.utils import OpenCVRenderer, SimulationError, XMLError
-from robosuite.utils.binding_utils import MjRenderContextOffscreen, MjSim
+from robosuite.utils import OpenCVRenderer, SimulationError
+from robosuite.utils.binding_utils import MjRenderContextOffscreen, MjSim, MjSimWarp
 
-REGISTERED_ENVS = {}
+REGISTERED_ENVS: dict[str, type[MujocoEnv]] = {}
 
 
-def register_env(target_class):
+def register_env(target_class: type[MujocoEnv]) -> None:
     REGISTERED_ENVS[target_class.__name__] = target_class
 
 
-def make(env_name, *args, **kwargs):
+def make(env_name: str, *args: Any, **kwargs: Any) -> MujocoEnv:
     """
     Instantiates a robosuite environment.
+
     This method attempts to mirror the equivalent functionality of gym.make in a somewhat sloppy way.
+
     Args:
         env_name (str): Name of the robosuite environment to initialize
         *args: Additional arguments to pass to the specific environment class initializer
         **kwargs: Additional arguments to pass to the specific environment class initializer
+
     Returns:
         MujocoEnv: Desired robosuite environment
+
     Raises:
         Exception: [Invalid environment name]
     """
@@ -43,7 +54,9 @@ def make(env_name, *args, **kwargs):
 class EnvMeta(type):
     """Metaclass for registering environments"""
 
-    def __new__(meta, name, bases, class_dict):
+    def __new__(
+        meta: type[MujocoEnv], name: str, bases: tuple[type, ...], class_dict: dict[str, Any]
+    ) -> type[MujocoEnv]:
         cls = super().__new__(meta, name, bases, class_dict)
 
         # List all environments that should not be registered here.
@@ -57,6 +70,7 @@ class EnvMeta(type):
 class MujocoEnv(metaclass=EnvMeta):
     """
     Initializes a Mujoco Environment.
+
     Args:
         has_renderer (bool): If true, render the simulation state in
             a viewer instead of headless mode.
@@ -80,24 +94,28 @@ class MujocoEnv(metaclass=EnvMeta):
             only calls sim.reset and resets all robosuite-internal variables
         renderer (str): string for the renderer to use
         renderer_config (dict): dictionary for the renderer configurations
+        use_warp (bool): Whether to use Mujoco Warp. Defaults to False.
+
     Raises:
         ValueError: [Invalid renderer selection]
     """
 
     def __init__(
         self,
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        render_camera="frontview",
-        render_collision_mesh=False,
-        render_visual_mesh=True,
-        render_gpu_device_id=-1,
-        control_freq=20,
-        horizon=1000,
-        ignore_done=False,
-        hard_reset=True,
-        renderer="mujoco",
-        renderer_config=None,
+        has_renderer: bool = False,
+        has_offscreen_renderer: bool = True,
+        render_camera: str = "frontview",
+        render_collision_mesh: bool = False,
+        render_visual_mesh: bool = True,
+        render_gpu_device_id: int = -1,
+        control_freq: int = 20,
+        horizon: int = 1000,
+        ignore_done: bool = False,
+        hard_reset: bool = True,
+        renderer: Literal["mujoco", "default", "nvisii"] = "mujoco",
+        renderer_config: dict | None = None,
+        use_warp: bool = False,
+        num_envs: int = 1,
     ):
         # If you're using an onscreen renderer, you must be also using an offscreen renderer!
         if has_renderer and not has_offscreen_renderer:
@@ -127,6 +145,8 @@ class MujocoEnv(metaclass=EnvMeta):
         self.control_timestep = None
         self.deterministic_reset = False  # Whether to add randomized resetting of objects / robot joints
 
+        self.use_warp = use_warp
+        self.num_envs = num_envs
         self.renderer = renderer
         self.renderer_config = renderer_config
 
@@ -215,10 +235,13 @@ class MujocoEnv(metaclass=EnvMeta):
 
     def _initialize_sim(self, xml_string=None):
         """
-        Creates a MjSim object and stores it in self.sim. If @xml_string is specified, the MjSim object will be created
-        from the specified xml_string. Else, it will pull from self.model to instantiate the simulation
+        Creates a simulation object and stores it in self.sim. If @xml_string is specified,
+        the sim object will be created from the specified xml_string. Else, it will pull from
+        self.model. When use_warp is True, an MjSimWarp instance is created instead of MjSim,
+        running num_envs parallel worlds on the GPU.
+
         Args:
-            xml_string (str): If specified, creates MjSim object from this filepath
+            xml_string (str): If specified, creates sim object from this xml string.
         """
         xml = xml_string if xml_string else self.model.get_xml()
 
@@ -227,7 +250,10 @@ class MujocoEnv(metaclass=EnvMeta):
             xml = self._xml_processor(xml)
 
         # Create the simulation instance
-        self.sim = MjSim.from_xml_string(xml)
+        if self.use_warp:
+            self.sim = MjSimWarp.from_xml_string(xml, num_envs=self.num_envs)
+        else:
+            self.sim = MjSim.from_xml_string(xml)
 
         # run a single step to make sure changes have propagated through sim state
         self.sim.forward()
@@ -348,20 +374,26 @@ class MujocoEnv(metaclass=EnvMeta):
                 modality = observable.modality + "-state"
                 if modality not in obs_by_modality:
                     obs_by_modality[modality] = []
-                # Make sure all observations are numpy arrays so we can concatenate them
+                # Make sure all observations are arrays so we can concatenate them
                 array_obs = [obs] if type(obs) in {int, float} or not obs.shape else obs
-                obs_by_modality[modality].append(np.array(array_obs))
+                if isinstance(array_obs, torch.Tensor):
+                    obs_by_modality[modality].append(array_obs)
+                else:
+                    obs_by_modality[modality].append(np.array(array_obs))
 
         # Add in modality observations
         for modality, obs in obs_by_modality.items():
             # To save memory, we only concatenate the image observations if explicitly requested
             if modality == "image-state" and not macros.CONCATENATE_IMAGES:
                 continue
-            observations[modality] = np.concatenate(obs, axis=-1)
+            if obs and isinstance(obs[0], torch.Tensor):
+                observations[modality] = torch.cat(obs, dim=-1)
+            else:
+                observations[modality] = np.concatenate(obs, axis=-1)
 
         return observations
 
-    def step(self, action):
+    def step(self, action: np.ndarray | wp.array) -> tuple[OrderedDict, float, bool, dict]:
         """
         Takes a step in simulation with control command @action.
         Args:
@@ -388,11 +420,26 @@ class MujocoEnv(metaclass=EnvMeta):
 
         # Loop through the simulation at the model timestep rate until we're ready to take the next policy step
         # (as defined by the control frequency specified at the environment level)
-        for i in range(int(self.control_timestep / self.model_timestep)):
-            self.sim.forward()
-            self._pre_action(action, policy_step)
+        _n_substeps = int(self.control_timestep / self.model_timestep)
+        _is_warp = isinstance(self.sim, MjSimWarp)
+        for i in range(_n_substeps):
+            if not _is_warp or i == 0:
+                if _is_warp:
+                    self.sim.kinematics_forward()
+                else:
+                    self.sim.forward()
+            self._pre_action(action, policy_step=(i == 0))
             self.sim.step()
-            self._update_observables()
+            if not _is_warp:
+                self._update_observables()
+            elif i == 0:
+                # For warp: update observables once per policy step (at substep 0).
+                for observable in self._observables.values():
+                    observable.update(
+                        timestep=self.control_timestep,
+                        obs_cache=self._obs_cache,
+                        force=True,
+                    )
             policy_step = False
 
         # Note: this is done all at once to avoid floating point inaccuracies
@@ -406,20 +453,31 @@ class MujocoEnv(metaclass=EnvMeta):
         observations = self.viewer._get_observations() if self.viewer_get_obs else self._get_observations()
         return observations, reward, done, info
 
-    def _pre_action(self, action, policy_step=False):
+    def _pre_action(self, action: np.ndarray | wp.array, policy_step: bool = False) -> None:
         """
         Do any preprocessing before taking an action.
-        Args:
-            action (np.array): Action to execute within the environment
-            policy_step (bool): Whether this current loop is an actual policy step or internal sim update step
-        """
-        self.sim.data.ctrl[:] = action
 
-    def _post_action(self, action):
+        Args:
+            action: Action to execute. When ``use_warp`` is True, should be a
+                ``wp.array`` of shape ``(num_envs, nu)`` already on the GPU so
+                that no CPU↔GPU transfer occurs. When ``use_warp`` is False,
+                a 1-D ``np.ndarray`` of shape ``(nu,)`` is expected.
+            policy_step: Whether this current loop is an actual policy step or
+                an internal sim update step.
+        """
+        if self.use_warp:
+            assert isinstance(self.sim, MjSimWarp)
+            # action must already be a wp.array of shape (num_envs, nu) on the GPU
+            self.sim.data.ctrl = action
+        else:
+            assert isinstance(self.sim, MjSim) and not isinstance(self.sim, MjSimWarp)
+            self.sim.data.ctrl[:] = action
+
+    def _post_action(self, action: np.ndarray | wp.array) -> tuple[float, bool, dict]:
         """
         Do any housekeeping after taking an action.
         Args:
-            action (np.array): Action to execute within the environment
+            action: Action that was executed within the environment.
         Returns:
             3-tuple:
                 - (float) reward from the environment
@@ -433,11 +491,11 @@ class MujocoEnv(metaclass=EnvMeta):
 
         return reward, self.done, {}
 
-    def reward(self, action):
+    def reward(self, action: np.ndarray | wp.array) -> float:
         """
-        Reward should be a function of state and action
+        Reward should be a function of state and action.
         Args:
-            action (np.array): Action to execute within the environment
+            action: Action that was executed within the environment.
         Returns:
             float: Reward from environment
         """
@@ -474,7 +532,7 @@ class MujocoEnv(metaclass=EnvMeta):
         observation = self.viewer._get_observations() if self.viewer_get_obs else self._get_observations()
         return observation
 
-    def clear_objects(self, object_names):
+    def clear_objects(self, object_names: str | list[str]) -> None:
         """
         Clears objects with the name @object_names out of the task space. This is useful
         for supporting task modes with single types of objects, as in
@@ -482,10 +540,21 @@ class MujocoEnv(metaclass=EnvMeta):
         Args:
             object_names (str or list of str): Name of object(s) to remove from the task workspace
         """
-        object_names = {object_names} if type(object_names) is str else set(object_names)
+        names: set[str] = {object_names} if type(object_names) is str else set(object_names)
+        assert self.sim is not None
         for obj in self.model.mujoco_objects:
-            if obj.name in object_names:
-                self.sim.data.set_joint_qpos(obj.joints[0], np.array((10, 10, 10, 1, 0, 0, 0)))
+            if obj.name in names:
+                if self.use_warp:
+                    import warp as wp
+
+                    assert isinstance(self.sim, MjSimWarp)
+                    val = np.tile(np.array((10, 10, 10, 1, 0, 0, 0), dtype=np.float32), (self.num_envs, 1))
+                    self.sim.data.set_joint_qpos(
+                        obj.joints[0], wp.from_numpy(val, device=self.sim._warp_data.qpos.device)
+                    )
+                else:
+                    assert not isinstance(self.sim, MjSimWarp)
+                    self.sim.data.set_joint_qpos(obj.joints[0], np.array((10, 10, 10, 1, 0, 0, 0)))
 
     def visualize(self, vis_settings):
         """
