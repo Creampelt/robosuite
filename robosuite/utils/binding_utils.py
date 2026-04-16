@@ -1697,16 +1697,24 @@ class MjSimWarp(MjSim):
     # put_data contract: njmax and nconmax are per-world caps; naconmax is the
     # total contact-buffer size across all worlds. ccd_iterations must be
     # sufficient for the most complex geometry in the scene.
-    _NJMAX_PER_ENV: int = 80
+    #
+    # Sizing these involves a tradeoff with num_envs:
+    #   efc.J memory  = nworld * njmax * nv_pad  (dense Jacobian, f32)
+    #   EPA scratch   = naccdmax * (440 + 164*ccd_iterations) bytes
+    # where naccdmax defaults to naconmax = _NACONMAX_PER_ENV * nworld. At very
+    # large nworld you may need to shrink these; at smaller nworld (< ~1000)
+    # the defaults here leave ample headroom.
+    #
+    # njmax is per-world: if you see "nefc overflow - please increase njmax to
+    # N", bump _NJMAX_PER_ENV above N. Mimicgen tasks (Coffee, Threading, etc.)
+    # commonly need ~3000 per world due to mesh-based collision geoms.
+    _NJMAX_PER_ENV: int = 3500
     _NCONMAX_PER_ENV: int = 128
     _NACONMAX_PER_ENV: int = 60
-    # ccd_iterations drives per-contact-pair EPA scratch buffers totalling
-    # naccdmax * (440 + 164*ccd_iterations) bytes across 5 arrays. Keep modest
-    # so large nworld leaves headroom for the policy + rollout buffers.
-    # 50 matches mujoco-warp's own test-suite default; bump if you see
-    # "opt.ccd_iterations needs to be increased" warnings or NaN obs at
-    # large nworld (convergence failures scale with world count).
-    _CCD_ITERATIONS: int = 100
+    # ccd_iterations is the EPA iteration cap per contact pair. Mujoco-warp
+    # warns "opt.ccd_iterations needs to be increased" when it hits this cap
+    # without converging; bump if you see the warning recurring.
+    _CCD_ITERATIONS: int = 200
 
     def __init__(self, model: mujoco.MjModel, num_envs: int = 1) -> None:
         """
