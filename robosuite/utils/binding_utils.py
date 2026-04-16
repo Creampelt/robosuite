@@ -1688,7 +1688,7 @@ class MjSimWarp(MjSim):
     # njmax/naconmax scale with num_envs; nconmax is a global broadphase buffer;
     # ccd_iterations must be sufficient for the most complex geometry in the scene.
     _NJMAX_PER_ENV: int = 80
-    _NCONMAX_PER_ENV: int = 60
+    _NCONMAX_PER_ENV: int = 128
     _NACONMAX_PER_ENV: int = 60
     _CCD_ITERATIONS: int = 2000
 
@@ -1712,6 +1712,12 @@ class MjSimWarp(MjSim):
         # parallel load (the default of 35 is too low for multi-env rollouts).
         self._warp_model = mjwarp.put_model(model)
         self._warp_model.opt.ccd_iterations = self._CCD_ITERATIONS
+
+        # Restore the XML-specified solver tolerance. mujoco-warp's put_model
+        # unconditionally clamps to max(tolerance, 1e-6) "because f32 GPU", but
+        # for contact-heavy manipulation tasks this costs a lot of fidelity
+        # relative to mujoco-python's f64 behaviour.
+        self._warp_model.opt.tolerance.fill_(float(model.opt.tolerance))
 
         # Warp data: njmax must be large enough to hold all constraint equations
         # across all worlds simultaneously.
