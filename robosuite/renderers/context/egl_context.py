@@ -142,14 +142,25 @@ class EGLGLContext:
             raise RuntimeError("Failed to make the EGL context current.")
 
     def free(self):
-        """Frees resources associated with this context."""
+        """Frees resources associated with this context.
+
+        At interpreter shutdown the atexit-registered ``eglTerminate`` may run
+        before this ``__del__``, after which every EGL call raises
+        EGL_NOT_INITIALIZED. Swallow those errors so shutdown stays clean.
+        """
         if self._context:
-            current_context = EGL.eglGetCurrentContext()
-            if current_context and self._context.address == current_context.address:
-                EGL.eglMakeCurrent(EGL_DISPLAY, EGL.EGL_NO_SURFACE, EGL.EGL_NO_SURFACE, EGL.EGL_NO_CONTEXT)
-            EGL.eglDestroyContext(EGL_DISPLAY, self._context)
-            EGL.eglReleaseThread()
+            try:
+                current_context = EGL.eglGetCurrentContext()
+                if current_context and self._context.address == current_context.address:
+                    EGL.eglMakeCurrent(EGL_DISPLAY, EGL.EGL_NO_SURFACE, EGL.EGL_NO_SURFACE, EGL.EGL_NO_CONTEXT)
+                EGL.eglDestroyContext(EGL_DISPLAY, self._context)
+                EGL.eglReleaseThread()
+            except error.Error:
+                pass
         self._context = None
 
     def __del__(self):
-        self.free()
+        try:
+            self.free()
+        except Exception:
+            pass

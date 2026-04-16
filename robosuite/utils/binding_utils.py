@@ -200,9 +200,18 @@ class MjRenderContext:
         mujoco.mjr_uploadTexture(self.model, self.con, tex_id)
 
     def __del__(self):
-        # free mujoco rendering context and GL rendering context
-        self.con.free()
-        self.gl_ctx.free()
+        # free mujoco rendering context and GL rendering context.
+        # Guarded because interpreter shutdown may run atexit hooks (notably
+        # eglTerminate) before this finalizer, which would otherwise raise
+        # EGL_NOT_INITIALIZED during render-context teardown.
+        try:
+            self.con.free()
+        except Exception:
+            pass
+        try:
+            self.gl_ctx.free()
+        except Exception:
+            pass
         del self.con
         del self.gl_ctx
         del self.scn
@@ -1684,13 +1693,20 @@ class MjSimWarp(MjSim):
         img = sim.render(env_idx=0, width=256, height=256)
     """
 
-    # Solver settings tuned for parallel warp rollouts.
-    # njmax/naconmax scale with num_envs; nconmax is a global broadphase buffer;
-    # ccd_iterations must be sufficient for the most complex geometry in the scene.
+    # Solver settings tuned for parallel warp rollouts. Per mujoco-warp's
+    # put_data contract: njmax and nconmax are per-world caps; naconmax is the
+    # total contact-buffer size across all worlds. ccd_iterations must be
+    # sufficient for the most complex geometry in the scene.
     _NJMAX_PER_ENV: int = 80
     _NCONMAX_PER_ENV: int = 128
     _NACONMAX_PER_ENV: int = 60
-    _CCD_ITERATIONS: int = 2000
+    # ccd_iterations drives per-contact-pair EPA scratch buffers totalling
+    # naccdmax * (440 + 164*ccd_iterations) bytes across 5 arrays. Keep modest
+    # so large nworld leaves headroom for the policy + rollout buffers.
+    # 50 matches mujoco-warp's own test-suite default; bump if you see
+    # "opt.ccd_iterations needs to be increased" warnings or NaN obs at
+    # large nworld (convergence failures scale with world count).
+    _CCD_ITERATIONS: int = 100
 
     def __init__(self, model: mujoco.MjModel, num_envs: int = 1) -> None:
         """
@@ -1719,13 +1735,13 @@ class MjSimWarp(MjSim):
         # relative to mujoco-python's f64 behaviour.
         self._warp_model.opt.tolerance.fill_(float(model.opt.tolerance))
 
-        # Warp data: njmax must be large enough to hold all constraint equations
-        # across all worlds simultaneously.
+        # Warp data: njmax and nconmax are per-world; naconmax is the total
+        # contact-buffer size across all worlds (see mujoco_warp.put_data docs).
         _ref_data = mujoco.MjData(model)
         self._warp_data = mjwarp.put_data(
             model, _ref_data, nworld=num_envs,
-            njmax=self._NJMAX_PER_ENV * num_envs,
-            nconmax=self._NCONMAX_PER_ENV * num_envs,
+            njmax=self._NJMAX_PER_ENV,
+            nconmax=self._NCONMAX_PER_ENV,
             naconmax=self._NACONMAX_PER_ENV * num_envs,
         )
 
