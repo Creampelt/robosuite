@@ -1716,11 +1716,33 @@ class MjSimWarp(MjSim):
     # without converging; bump if you see the warning recurring.
     _CCD_ITERATIONS: int = 200
 
-    def __init__(self, model: mujoco.MjModel, num_envs: int = 1) -> None:
+    # Currently-active per-task overrides, set by ``robosuite.make()`` when the
+    # task's env_kwargs include ``njmax_per_env`` / ``naconmax_per_env``. Read
+    # here with precedence: per-instance kwarg > active override > class default.
+    # Stored at class scope so that hard_reset rebuilds (which call
+    # ``from_xml_string`` directly rather than going through ``robosuite.make``)
+    # still pick up the task's override.
+    _ACTIVE_NJMAX_PER_ENV: Optional[int] = None
+    _ACTIVE_NACONMAX_PER_ENV: Optional[int] = None
+
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        num_envs: int = 1,
+        njmax_per_env: Optional[int] = None,
+        naconmax_per_env: Optional[int] = None,
+    ) -> None:
         """
         Args:
             model: a ``mujoco.MjModel`` instance (not yet wrapped).
             num_envs: number of parallel worlds to simulate.
+            njmax_per_env: per-world cap for active efc constraints. When
+                ``None``, falls back to ``_ACTIVE_NJMAX_PER_ENV`` (set by
+                ``robosuite.make`` from task env_kwargs), then to
+                ``_NJMAX_PER_ENV``.
+            naconmax_per_env: per-env contribution to the total contact-buffer
+                pool (total ``naconmax`` = this x ``num_envs``). Same fallback
+                order as ``njmax_per_env``.
         """
         import mujoco_warp as mjwarp
         import warp as wp
@@ -1729,6 +1751,27 @@ class MjSimWarp(MjSim):
         self._wp = wp
         self.num_envs: int = num_envs
 
+        # Optional env-var knobs (for benchmarking speed-vs-accuracy tradeoffs).
+        # Defaults preserve existing behaviour.
+        #   ROBOSUITE_WARP_TOLERANCE_CLAMP=1  -> accept mujoco-warp's 1e-6 clamp
+        #   ROBOSUITE_WARP_SOLVER_ITERS=<int> -> override opt.iterations
+        #   ROBOSUITE_WARP_LS_ITERS=<int>     -> override opt.ls_iterations
+        #   ROBOSUITE_WARP_CONE=pyramidal|elliptic -> override opt.cone
+        _accept_tol_clamp = os.environ.get("ROBOSUITE_WARP_TOLERANCE_CLAMP", "0") == "1"
+        _solver_iters = os.environ.get("ROBOSUITE_WARP_SOLVER_ITERS")
+        _ls_iters = os.environ.get("ROBOSUITE_WARP_LS_ITERS")
+        _cone_env = os.environ.get("ROBOSUITE_WARP_CONE")
+
+        if _cone_env is not None:
+            cone_map = {"pyramidal": 0, "elliptic": 1}
+            if _cone_env not in cone_map:
+                raise ValueError(f"ROBOSUITE_WARP_CONE={_cone_env!r}; expected pyramidal|elliptic")
+            model.opt.cone = cone_map[_cone_env]
+        if _solver_iters is not None:
+            model.opt.iterations = int(_solver_iters)
+        if _ls_iters is not None:
+            model.opt.ls_iterations = int(_ls_iters)
+
         # Shared model wrapper — identical for every env
         self.model = MjModelWarp(model)
 
@@ -1736,40 +1779,96 @@ class MjSimWarp(MjSim):
         # parallel load (the default of 35 is too low for multi-env rollouts).
         self._warp_model = mjwarp.put_model(model)
         self._warp_model.opt.ccd_iterations = self._CCD_ITERATIONS
+        # put_model copies from MjModel for most fields, but mirror iterations
+        # explicitly in case the warp layout diverges.
+        if _solver_iters is not None:
+            self._warp_model.opt.iterations = int(_solver_iters)
+        if _ls_iters is not None:
+            self._warp_model.opt.ls_iterations = int(_ls_iters)
 
         # Restore the XML-specified solver tolerance. mujoco-warp's put_model
         # unconditionally clamps to max(tolerance, 1e-6) "because f32 GPU", but
         # for contact-heavy manipulation tasks this costs a lot of fidelity
         # relative to mujoco-python's f64 behaviour.
-        self._warp_model.opt.tolerance.fill_(float(model.opt.tolerance))
+        if not _accept_tol_clamp:
+            self._warp_model.opt.tolerance.fill_(float(model.opt.tolerance))
+
+        # Resolve effective buffer sizes: per-instance kwarg > class-level
+        # active override (set by robosuite.make from task env_kwargs) > class
+        # default. Stored on self for auditability.
+        effective_njmax = (
+            njmax_per_env
+            if njmax_per_env is not None
+            else (self._ACTIVE_NJMAX_PER_ENV if self._ACTIVE_NJMAX_PER_ENV is not None else self._NJMAX_PER_ENV)
+        )
+        effective_naconmax_per_env = (
+            naconmax_per_env
+            if naconmax_per_env is not None
+            else (self._ACTIVE_NACONMAX_PER_ENV if self._ACTIVE_NACONMAX_PER_ENV is not None else self._NACONMAX_PER_ENV)
+        )
+        self._effective_njmax_per_env: int = int(effective_njmax)
+        self._effective_naconmax_per_env: int = int(effective_naconmax_per_env)
 
         # Warp data: njmax and nconmax are per-world; naconmax is the total
         # contact-buffer size across all worlds (see mujoco_warp.put_data docs).
         _ref_data = mujoco.MjData(model)
         self._warp_data = mjwarp.put_data(
             model, _ref_data, nworld=num_envs,
-            njmax=self._NJMAX_PER_ENV,
+            njmax=self._effective_njmax_per_env,
             nconmax=self._NCONMAX_PER_ENV,
-            naconmax=self._NACONMAX_PER_ENV * num_envs,
+            naconmax=self._effective_naconmax_per_env * num_envs,
         )
 
         self.data = MjDataWarp(self.model, self._warp_data, self._warp_model, num_envs)
         self._render_context_offscreen = None
+
+        # CUDA graph capture state (opt-in via ROBOSUITE_WARP_GRAPH=1).
+        # First N steps run eagerly so all kernels JIT-compile; next step is
+        # captured into a graph; subsequent steps replay via capture_launch.
+        # Writing to d.ctrl between launches is fine — graph captures kernel
+        # sequence, not input values. Reset and kinematics_forward are outside
+        # the captured region.
+        self._graph_enabled: bool = os.environ.get("ROBOSUITE_WARP_GRAPH", "0") == "1"
+        self._graph_warmup_steps: int = int(os.environ.get("ROBOSUITE_WARP_GRAPH_WARMUP", "3"))
+        self._graph_steps_done: int = 0
+        self._step_graph = None
 
     # ------------------------------------------------------------------
     # Factory methods
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_xml_string(cls, xml: str, num_envs: int = 1) -> "MjSimWarp":
+    def from_xml_string(
+        cls,
+        xml: str,
+        num_envs: int = 1,
+        njmax_per_env: Optional[int] = None,
+        naconmax_per_env: Optional[int] = None,
+    ) -> "MjSimWarp":
         model = mujoco.MjModel.from_xml_string(xml)
-        return cls(model, num_envs=num_envs)
+        return cls(
+            model,
+            num_envs=num_envs,
+            njmax_per_env=njmax_per_env,
+            naconmax_per_env=naconmax_per_env,
+        )
 
     @classmethod
-    def from_xml_file(cls, xml_file: str, num_envs: int = 1) -> "MjSimWarp":
+    def from_xml_file(
+        cls,
+        xml_file: str,
+        num_envs: int = 1,
+        njmax_per_env: Optional[int] = None,
+        naconmax_per_env: Optional[int] = None,
+    ) -> "MjSimWarp":
         with open(xml_file, "r") as f:
             xml = f.read()
-        return cls.from_xml_string(xml, num_envs=num_envs)
+        return cls.from_xml_string(
+            xml,
+            num_envs=num_envs,
+            njmax_per_env=njmax_per_env,
+            naconmax_per_env=naconmax_per_env,
+        )
 
     # ------------------------------------------------------------------
     # Core simulation
@@ -1815,7 +1914,24 @@ class MjSimWarp(MjSim):
 
     def step(self, with_udd: bool = True) -> None:
         """Advance all envs by one timestep on the GPU."""
-        self._mjwarp.step(self._warp_model, self._warp_data)
+        if not self._graph_enabled:
+            self._mjwarp.step(self._warp_model, self._warp_data)
+            return
+
+        if self._step_graph is not None:
+            self._wp.capture_launch(self._step_graph)
+            return
+
+        if self._graph_steps_done < self._graph_warmup_steps:
+            self._mjwarp.step(self._warp_model, self._warp_data)
+            self._graph_steps_done += 1
+            return
+
+        # Capture: the scope runs the step once as it records the kernel graph.
+        self._wp.synchronize()
+        with self._wp.ScopedCapture() as cap:
+            self._mjwarp.step(self._warp_model, self._warp_data)
+        self._step_graph = cap.graph
 
     # ------------------------------------------------------------------
     # State management

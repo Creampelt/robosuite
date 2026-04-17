@@ -34,7 +34,13 @@ def make(env_name: str, *args: Any, **kwargs: Any) -> MujocoEnv:
     Args:
         env_name (str): Name of the robosuite environment to initialize
         *args: Additional arguments to pass to the specific environment class initializer
-        **kwargs: Additional arguments to pass to the specific environment class initializer
+        **kwargs: Additional arguments to pass to the specific environment class initializer.
+            Recognised side-channel kwargs (popped before dispatch, so env class
+            signatures don't need to thread them): ``njmax_per_env``,
+            ``naconmax_per_env`` — warp-sim buffer sizes passed through to
+            ``MjSimWarp`` via ``_ACTIVE_NJMAX_PER_ENV`` / ``_ACTIVE_NACONMAX_PER_ENV``.
+            Intended to be set per-task via the BC config's
+            ``experiment.env_meta_update_dict.env_kwargs``.
 
     Returns:
         MujocoEnv: Desired robosuite environment
@@ -42,6 +48,13 @@ def make(env_name: str, *args: Any, **kwargs: Any) -> MujocoEnv:
     Raises:
         Exception: [Invalid environment name]
     """
+    njmax_per_env = kwargs.pop("njmax_per_env", None)
+    naconmax_per_env = kwargs.pop("naconmax_per_env", None)
+    if njmax_per_env is not None:
+        MjSimWarp._ACTIVE_NJMAX_PER_ENV = int(njmax_per_env)
+    if naconmax_per_env is not None:
+        MjSimWarp._ACTIVE_NACONMAX_PER_ENV = int(naconmax_per_env)
+
     if env_name not in REGISTERED_ENVS:
         raise Exception(
             "Environment {} not found. Make sure it is a registered environment among: {}".format(
