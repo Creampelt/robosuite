@@ -283,7 +283,12 @@ class Controller(object, metaclass=abc.ABCMeta):
         env 0 to CPU.
         """
         if isinstance(self.sim, MjSimWarp):
-            joint = self.joint_pos[0, self.qpos_index].cpu().numpy()
+            # self.joint_pos is already sliced to qpos_index (shape
+            # (num_envs, ndof)); double-indexing with qpos_index would be
+            # out-of-bounds for any task whose arm joints don't start at
+            # global qpos index 0 (e.g. HammerCleanup with a drawer slide
+            # joint before the arm).
+            joint = self.joint_pos[0].cpu().numpy()
             ee_pos = self.ee_pos[0].cpu().numpy()
             ee_ori_mat = self.ee_ori_mat[0].cpu().numpy()
         else:
