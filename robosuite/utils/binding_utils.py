@@ -1712,8 +1712,14 @@ class MjSimWarp(MjSim):
     _NCONMAX_PER_ENV: int = 128
     _NACONMAX_PER_ENV: int = 60
     # ccd_iterations is the EPA iteration cap per contact pair. Mujoco-warp
-    # warns "opt.ccd_iterations needs to be increased" when it hits this cap
-    # without converging; bump if you see the warning recurring.
+    # emits "Warning: opt.ccd_iterations needs to be increased" from a device
+    # kernel when EPA hits this cap without converging. Coffee's mesh pod /
+    # holder geometry hits it sometimes even at 200, but the fallback contact
+    # is close enough not to matter — we just silence the printf at the
+    # subprocess level (see run_official_dppo_mimicgen._WARP_NOISE_PATTERNS).
+    # Raising the cap nearly doubles per-step rollout time at 128 envs
+    # (measured: 22s/iter → 50s/iter at 400), so default stays 200.
+    # Override with ROBOSUITE_WARP_CCD_ITERATIONS if you want the fidelity.
     _CCD_ITERATIONS: int = 200
 
     # Currently-active per-task overrides, set by ``robosuite.make()`` when the
@@ -1757,10 +1763,13 @@ class MjSimWarp(MjSim):
         #   ROBOSUITE_WARP_SOLVER_ITERS=<int> -> override opt.iterations
         #   ROBOSUITE_WARP_LS_ITERS=<int>     -> override opt.ls_iterations
         #   ROBOSUITE_WARP_CONE=pyramidal|elliptic -> override opt.cone
+        #   ROBOSUITE_WARP_CCD_ITERATIONS=<int> -> override opt.ccd_iterations
         _accept_tol_clamp = os.environ.get("ROBOSUITE_WARP_TOLERANCE_CLAMP", "0") == "1"
         _solver_iters = os.environ.get("ROBOSUITE_WARP_SOLVER_ITERS")
         _ls_iters = os.environ.get("ROBOSUITE_WARP_LS_ITERS")
         _cone_env = os.environ.get("ROBOSUITE_WARP_CONE")
+        _ccd_iters_env = os.environ.get("ROBOSUITE_WARP_CCD_ITERATIONS")
+        _effective_ccd = int(_ccd_iters_env) if _ccd_iters_env is not None else self._CCD_ITERATIONS
 
         if _cone_env is not None:
             cone_map = {"pyramidal": 0, "elliptic": 1}
@@ -1778,7 +1787,7 @@ class MjSimWarp(MjSim):
         # Warp model: increase CCD iterations to avoid solver warnings under
         # parallel load (the default of 35 is too low for multi-env rollouts).
         self._warp_model = mjwarp.put_model(model)
-        self._warp_model.opt.ccd_iterations = self._CCD_ITERATIONS
+        self._warp_model.opt.ccd_iterations = _effective_ccd
         # put_model copies from MjModel for most fields, but mirror iterations
         # explicitly in case the warp layout diverges.
         if _solver_iters is not None:

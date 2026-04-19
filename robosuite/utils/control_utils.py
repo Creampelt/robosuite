@@ -280,7 +280,10 @@ def opspace_matrices_torch(
         lambda_full (B, 6, 6), lambda_pos (B, 3, 3), lambda_ori (B, 3, 3), nullspace_matrix (B, ndof, ndof)
     """
     # mass_matrix is (B, ndof, ndof) — per-env, so each env gets its own inertia tensor.
-    M_inv = torch.linalg.inv(mass_matrix)  # (B, ndof, ndof)
+    # pinv (not inv) so a single corrupted env — e.g. NaN/near-singular qM from a post-
+    # divergence env that hasn't been scrubbed yet — doesn't raise and take down the
+    # whole batched controller launch. Post-step obs-NaN detection resets the bad env.
+    M_inv = torch.linalg.pinv(mass_matrix, rcond=1e-6)  # (B, ndof, ndof)
 
     # rcond=1e-4 mirrors numpy's pinv rcond threshold and prevents NaN/inf when the
     # Jacobian is near-singular (e.g. after a contact event with rapid joint movement).
