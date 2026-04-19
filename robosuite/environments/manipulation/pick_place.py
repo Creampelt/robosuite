@@ -6,6 +6,7 @@ import random
 from collections import OrderedDict
 
 import numpy as np
+import torch
 
 if TYPE_CHECKING:
     import warp as wp
@@ -24,6 +25,7 @@ from robosuite.models.objects import (
     MilkVisualObject,
 )
 from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 
@@ -209,7 +211,15 @@ class PickPlace(SingleArmEnv):
         renderer_config=None,
         use_warp: bool = False,
         num_envs: int = 1,
+        fall_off_termination: bool = False,
+        fall_off_z_margin: float = 0.1,
     ):
+        # Early-termination when any active object drops below the bin-1
+        # surface plane minus ``fall_off_z_margin``. Gated so BC eval /
+        # demo-gen keep the no-termination behaviour unless opted in.
+        self.fall_off_termination = fall_off_termination
+        self.fall_off_z_margin = fall_off_z_margin
+
         # task settings
         self.single_object_mode = single_object_mode
         self.object_to_id = {"milk": 0, "bread": 1, "cereal": 2, "can": 3}
@@ -270,33 +280,22 @@ class PickPlace(SingleArmEnv):
 
     def reward(self, action: np.ndarray | wp.array = None) -> float:
         """
-        Reward function for the task.
+        Sparse reward (1.0 per object in the correct bin). Shaped-reward
+        terms are CPU-only and silently disabled under warp.
 
-        Sparse un-normalized reward:
-
-          - a discrete reward of 1.0 per object if it is placed in its correct bin
-
-        Un-normalized components if using reward shaping, where the maximum is returned if not solved:
-
-          - Reaching: in [0, 0.1], proportional to the distance between the gripper and the closest object
-          - Grasping: in {0, 0.35}, nonzero if the gripper is grasping an object
-          - Lifting: in {0, [0.35, 0.5]}, nonzero only if object is grasped; proportional to lifting height
-          - Hovering: in {0, [0.5, 0.7]}, nonzero only if object is lifted; proportional to distance from object to bin
-
-        Note that a successfully completed task (object in bin) will return 1.0 per object irregardless of whether the
-        environment is using sparse or shaped rewards
-
-        Note that the final reward is normalized and scaled by reward_scale / 4.0 (or 1.0 if only a single object is
-        being used) as well so that the max score is equal to reward_scale
-
-        Args:
-            action (np.array): [NOT USED]
-
-        Returns:
-            float: reward value
+        Scalar float under CPU; ``(num_envs,)`` float tensor under warp.
         """
-        # compute sparse rewards
+        # Populate self.objects_in_bins.
         self._check_success()
+
+        if isinstance(self.sim, MjSimWarp):
+            reward = self.objects_in_bins.float().sum(dim=-1)
+            if self.reward_scale is not None:
+                reward = reward * self.reward_scale
+                if self.single_object_mode == 0:
+                    reward = reward / 4.0
+            return reward
+
         reward = np.sum(self.objects_in_bins)
 
         # add in shaped rewards
@@ -402,7 +401,12 @@ class PickPlace(SingleArmEnv):
         return r_reach, r_grasp, r_lift, r_hover
 
     def not_in_bin(self, obj_pos, bin_id):
+        """Per-env "object is outside its target bin" check.
 
+        Under warp ``obj_pos`` is a ``(num_envs, 3)`` tensor; the result
+        is a ``(num_envs,)`` bool tensor. Under CPU ``obj_pos`` is
+        ``(3,)`` and the result is a scalar bool — matches upstream.
+        """
         bin_x_low = self.bin2_pos[0]
         bin_y_low = self.bin2_pos[1]
         if bin_id == 0 or bin_id == 2:
@@ -412,6 +416,14 @@ class PickPlace(SingleArmEnv):
 
         bin_x_high = bin_x_low + self.bin_size[0] / 2
         bin_y_high = bin_y_low + self.bin_size[1] / 2
+
+        if isinstance(self.sim, MjSimWarp):
+            in_x = (obj_pos[..., 0] > bin_x_low) & (obj_pos[..., 0] < bin_x_high)
+            in_y = (obj_pos[..., 1] > bin_y_low) & (obj_pos[..., 1] < bin_y_high)
+            in_z = (obj_pos[..., 2] > float(self.bin2_pos[2])) & (
+                obj_pos[..., 2] < float(self.bin2_pos[2]) + 0.1
+            )
+            return ~(in_x & in_y & in_z)
 
         res = True
         if (
@@ -564,8 +576,16 @@ class PickPlace(SingleArmEnv):
             self.obj_body_id[obj.name] = self.sim.model.body_name2id(obj.root_body)
             self.obj_geom_id[obj.name] = [self.sim.model.geom_name2id(g) for g in obj.contact_geoms]
 
-        # keep track of which objects are in their corresponding bins
-        self.objects_in_bins = np.zeros(len(self.objects))
+        # keep track of which objects are in their corresponding bins.
+        # Under warp: per-env (num_envs, n_objects) bool tensor on device.
+        if isinstance(self.sim, MjSimWarp):
+            self.objects_in_bins = torch.zeros(
+                (self.num_envs, len(self.objects)),
+                dtype=torch.bool,
+                device="cuda",
+            )
+        else:
+            self.objects_in_bins = np.zeros(len(self.objects))
 
         # target locations in bin for each object type
         self.target_bin_placements = np.zeros((len(self.objects), 3))
@@ -602,11 +622,13 @@ class PickPlace(SingleArmEnv):
             # for conversion to relative gripper frame
             @sensor(modality=modality)
             def world_pose_in_gripper(obs_cache):
-                return (
-                    T.pose_inv(T.pose2mat((obs_cache[f"{pf}eef_pos"], obs_cache[f"{pf}eef_quat"])))
-                    if f"{pf}eef_pos" in obs_cache and f"{pf}eef_quat" in obs_cache
-                    else np.eye(4)
-                )
+                if f"{pf}eef_pos" not in obs_cache or f"{pf}eef_quat" not in obs_cache:
+                    return np.eye(4)
+                eef_pos = obs_cache[f"{pf}eef_pos"]
+                eef_quat = obs_cache[f"{pf}eef_quat"]
+                if isinstance(self.sim, MjSimWarp):
+                    return T.pose_inv_torch(T.pose2mat_torch(eef_pos, eef_quat))
+                return T.pose_inv(T.pose2mat((eef_pos, eef_quat)))
 
             sensors = [world_pose_in_gripper]
             names = ["world_pose_in_gripper"]
@@ -664,19 +686,38 @@ class PickPlace(SingleArmEnv):
 
         @sensor(modality=modality)
         def obj_pos(obs_cache):
-            return np.array(self.sim.data.body_xpos[self.obj_body_id[obj_name]])
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                return self.sim.data.body_xpos[bid]  # (N, 3)
+            return np.array(self.sim.data.body_xpos[bid])
 
         @sensor(modality=modality)
         def obj_quat(obs_cache):
-            return T.convert_quat(self.sim.data.body_xquat[self.obj_body_id[obj_name]], to="xyzw")
+            bid = self.obj_body_id[obj_name]
+            if isinstance(self.sim, MjSimWarp):
+                q = self.sim.data.body_xquat[bid]  # (N, 4) wxyz
+                return q[..., [1, 2, 3, 0]]
+            return T.convert_quat(self.sim.data.body_xquat[bid], to="xyzw")
 
         @sensor(modality=modality)
         def obj_to_eef_pos(obs_cache):
-            # Immediately return default value if cache is empty
             if any(
                 [name not in obs_cache for name in [f"{obj_name}_pos", f"{obj_name}_quat", "world_pose_in_gripper"]]
             ):
+                if isinstance(self.sim, MjSimWarp):
+                    return torch.zeros(
+                        self.num_envs, 3, dtype=torch.float32,
+                        device="cuda",
+                    )
                 return np.zeros(3)
+            if isinstance(self.sim, MjSimWarp):
+                obj_pos_t = obs_cache[f"{obj_name}_pos"]
+                obj_quat_t = obs_cache[f"{obj_name}_quat"]
+                world_poses = obs_cache["world_pose_in_gripper"]
+                obj_pose = T.pose2mat_torch(obj_pos_t, obj_quat_t)
+                rel_pose = world_poses @ obj_pose
+                obs_cache[f"{obj_name}_to_{pf}eef_quat"] = T.mat2quat_torch(rel_pose[:, :3, :3])
+                return rel_pose[:, :3, 3]
             obj_pose = T.pose2mat((obs_cache[f"{obj_name}_pos"], obs_cache[f"{obj_name}_quat"]))
             rel_pose = T.pose_in_A_to_pose_in_B(obj_pose, obs_cache["world_pose_in_gripper"])
             rel_pos, rel_quat = T.mat2pose(rel_pose)
@@ -685,9 +726,15 @@ class PickPlace(SingleArmEnv):
 
         @sensor(modality=modality)
         def obj_to_eef_quat(obs_cache):
-            return (
-                obs_cache[f"{obj_name}_to_{pf}eef_quat"] if f"{obj_name}_to_{pf}eef_quat" in obs_cache else np.zeros(4)
-            )
+            key = f"{obj_name}_to_{pf}eef_quat"
+            if key in obs_cache:
+                return obs_cache[key]
+            if isinstance(self.sim, MjSimWarp):
+                return torch.zeros(
+                    self.num_envs, 4, dtype=torch.float32,
+                    device="cuda",
+                )
+            return np.zeros(4)
 
         sensors = [obj_pos, obj_quat, obj_to_eef_pos, obj_to_eef_quat]
         names = [f"{obj_name}_pos", f"{obj_name}_quat", f"{obj_name}_to_{pf}eef_pos", f"{obj_name}_to_{pf}eef_quat"]
@@ -697,35 +744,64 @@ class PickPlace(SingleArmEnv):
     def _reset_internal(self):
         """
         Resets simulation internal configurations.
+
+        Warp branch samples per-env placements via ``sample_batch(k)``
+        with ``k = |_reset_env_mask|`` and writes only masked rows. Visual
+        objects are placed via ``sim.model.body_pos`` — under warp this is
+        a CPU-only mutation that does not propagate to ``_warp_model`` (a
+        one-off snapshot at init), but visual objects are cosmetic only
+        and don't affect physics.
         """
         super()._reset_internal()
 
-        # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
 
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
+                assert isinstance(self.sim, MjSimWarp)
 
-            # Loop through all objects and reset their positions
-            for obj_pos, obj_quat, obj in object_placements.values():
-                # Set the visual object body locations
-                if "visual" in obj.name.lower():
-                    self.sim.model.body_pos[self.obj_body_id[obj.name]] = obj_pos
-                    self.sim.model.body_quat[self.obj_body_id[obj.name]] = obj_quat
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
                 else:
-                    # Set the collision object joints
-                    if self.use_warp:
-                        import warp as wp
-                        from robosuite.utils.binding_utils import MjSimWarp
-                        assert isinstance(self.sim, MjSimWarp)
-                        _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
-                        _val_batch = np.tile(_val, (self.num_envs, 1))
-                        self.sim.data.set_joint_qpos(
-                            obj.joints[0],
-                            wp.from_numpy(_val_batch, device=self.sim._warp_data.qpos.device),
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        if "visual" in obj.name.lower():
+                            # Visual-only — no free joint. Skip under warp
+                            # (model snapshot was taken at init).
+                            continue
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
                         )
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                # Sample from the placement initializer for all objects
+                object_placements = self.placement_initializer.sample()
+
+                # Loop through all objects and reset their positions
+                for obj_pos, obj_quat, obj in object_placements.values():
+                    # Set the visual object body locations
+                    if "visual" in obj.name.lower():
+                        self.sim.model.body_pos[self.obj_body_id[obj.name]] = obj_pos
+                        self.sim.model.body_quat[self.obj_body_id[obj.name]] = obj_quat
                     else:
-                        self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
+                        self.sim.data.set_joint_qpos(
+                            obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)])
+                        )
 
         # Set the bins to the desired position
         self.sim.model.body_pos[self.sim.model.body_name2id("bin1")] = self.bin1_pos
@@ -757,9 +833,20 @@ class PickPlace(SingleArmEnv):
         """
         Check if all objects have been successfully placed in their corresponding bins.
 
-        Returns:
-            bool: True if all objects are placed correctly
+        Scalar bool under CPU; ``(num_envs,)`` bool tensor under warp.
         """
+        if isinstance(self.sim, MjSimWarp):
+            gripper_site_pos = self.sim.data.site_xpos[self.robots[0].eef_site_id]  # (N, 3)
+            for i, obj in enumerate(self.objects):
+                obj_pos = self.sim.data.body_xpos[self.obj_body_id[obj.name]]  # (N, 3)
+                dist = torch.linalg.vector_norm(gripper_site_pos - obj_pos, dim=-1)
+                r_reach = 1.0 - torch.tanh(10.0 * dist)
+                self.objects_in_bins[:, i] = (~self.not_in_bin(obj_pos, i)) & (r_reach < 0.6)
+
+            if self.single_object_mode in {1, 2}:
+                return self.objects_in_bins.any(dim=-1)
+            return self.objects_in_bins.all(dim=-1)
+
         # remember objects that are in the correct bins
         gripper_site_pos = self.sim.data.site_xpos[self.robots[0].eef_site_id]
         for i, obj in enumerate(self.objects):
@@ -775,6 +862,42 @@ class PickPlace(SingleArmEnv):
 
         # returns True if all objects are in correct bins
         return np.sum(self.objects_in_bins) == len(self.objects)
+
+    # ------------------------------------------------------------------
+    # Early-termination hook
+    # ------------------------------------------------------------------
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        """Collision objects monitored by the fall-off check.
+
+        In ``single_object_mode in {1, 2}`` only the active object is in
+        play (others live at ``(10, 10, 10)``); restrict the check to it
+        to avoid spurious terminations.
+        """
+        if self.single_object_mode in (1, 2):
+            return (self.objects[self.object_id].name,) if hasattr(self, "object_id") else tuple()
+        return tuple(obj.name for obj in self.objects)
+
+    def _check_early_termination(self):
+        """Flag envs where any tracked object drops below the bin-1 plane.
+
+        Threshold is ``bin1_pos[2] - fall_off_z_margin``. Gated by
+        ``fall_off_termination`` so BC eval / demo-gen keep the original
+        (no-termination) behaviour unless opted in.
+        """
+        try:
+            extras = super()._check_early_termination()
+        except AttributeError:
+            extras = {}
+        if not self.fall_off_termination:
+            return extras
+        threshold = float(self.bin1_pos[2]) - float(self.fall_off_z_margin)
+        for obj_name in self._fall_off_tracked_objects():
+            if obj_name not in self.obj_body_id:
+                continue
+            pos = self.sim.data.body_xpos[self.obj_body_id[obj_name]]
+            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
+        return extras
 
     def visualize(self, vis_settings):
         """

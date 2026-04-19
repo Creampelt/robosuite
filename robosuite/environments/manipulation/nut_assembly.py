@@ -6,6 +6,7 @@ import random
 from collections import OrderedDict
 
 import numpy as np
+import torch
 
 if TYPE_CHECKING:
     import warp as wp
@@ -15,6 +16,7 @@ from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import PegsArena
 from robosuite.models.objects import RoundNutObject, SquareNutObject
 from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.binding_utils import MjSimWarp
 from robosuite.utils.observables import Observable, sensor
 from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 
@@ -192,7 +194,15 @@ class NutAssembly(SingleArmEnv):
         renderer_config=None,
         use_warp: bool = False,
         num_envs: int = 1,
+        fall_off_termination: bool = False,
+        fall_off_z_margin: float = 0.1,
     ):
+        # Early-termination when a nut drops below ``table_offset[2] -
+        # fall_off_z_margin``. Gated so BC eval / demo-gen keep the
+        # original (no-termination) semantics.
+        self.fall_off_termination = fall_off_termination
+        self.fall_off_z_margin = fall_off_z_margin
+
         # task settings
         self.single_object_mode = single_object_mode
         self.nut_to_id = {"square": 0, "round": 1}
@@ -250,33 +260,25 @@ class NutAssembly(SingleArmEnv):
 
     def reward(self, action: np.ndarray | wp.array = None) -> float:
         """
-        Reward function for the task.
+        Sparse reward (1.0 per nut on the correct peg). Shaped-reward terms
+        are CPU-only and silently disabled under warp.
 
-        Sparse un-normalized reward:
-
-          - a discrete reward of 1.0 per nut if it is placed around its correct peg
-
-        Un-normalized components if using reward shaping, where the maximum is returned if not solved:
-
-          - Reaching: in [0, 0.1], proportional to the distance between the gripper and the closest nut
-          - Grasping: in {0, 0.35}, nonzero if the gripper is grasping a nut
-          - Lifting: in {0, [0.35, 0.5]}, nonzero only if nut is grasped; proportional to lifting height
-          - Hovering: in {0, [0.5, 0.7]}, nonzero only if nut is lifted; proportional to distance from nut to peg
-
-        Note that a successfully completed task (nut around peg) will return 1.0 per nut irregardless of whether the
-        environment is using sparse or shaped rewards
-
-        Note that the final reward is normalized and scaled by reward_scale / 2.0 (or 1.0 if only a single nut is
-        being used) as well so that the max score is equal to reward_scale
-
-        Args:
-            action (np.array): [NOT USED]
-
-        Returns:
-            float: reward value
+        Returns a scalar under CPU sims and a ``(num_envs,)`` float tensor
+        under warp.
         """
-        # compute sparse rewards
+        # Populate self.objects_on_pegs.
         self._check_success()
+
+        if isinstance(self.sim, MjSimWarp):
+            # self.objects_on_pegs is (num_envs, n_nuts) bool; sum → per-env
+            # float count of nuts correctly placed.
+            reward = self.objects_on_pegs.float().sum(dim=-1)
+            if self.reward_scale is not None:
+                reward = reward * self.reward_scale
+                if self.single_object_mode == 0:
+                    reward = reward / 2.0
+            return reward
+
         reward = np.sum(self.objects_on_pegs)
 
         # add in shaped rewards
@@ -375,11 +377,23 @@ class NutAssembly(SingleArmEnv):
         return r_reach, r_grasp, r_lift, r_hover
 
     def on_peg(self, obj_pos, peg_id):
+        """Per-env "is nut over peg" check.
 
-        if peg_id == 0:
-            peg_pos = np.array(self.sim.data.body_xpos[self.peg1_body_id])
-        else:
-            peg_pos = np.array(self.sim.data.body_xpos[self.peg2_body_id])
+        Under warp ``obj_pos`` is a ``(num_envs, 3)`` tensor and ``peg_pos``
+        is likewise batched, so the result is a ``(num_envs,)`` bool tensor.
+        Under CPU ``obj_pos`` is a ``(3,)`` array and the result is a scalar
+        bool — preserving upstream semantics.
+        """
+        peg_body_id = self.peg1_body_id if peg_id == 0 else self.peg2_body_id
+        peg_pos = self.sim.data.body_xpos[peg_body_id]
+
+        if isinstance(self.sim, MjSimWarp):
+            dx = torch.abs(obj_pos[..., 0] - peg_pos[..., 0])
+            dy = torch.abs(obj_pos[..., 1] - peg_pos[..., 1])
+            z_ok = obj_pos[..., 2] < float(self.table_offset[2]) + 0.05
+            return (dx < 0.03) & (dy < 0.03) & z_ok
+
+        peg_pos = np.array(peg_pos)
         res = False
         if (
             abs(obj_pos[0] - peg_pos[0]) < 0.03
@@ -479,8 +493,18 @@ class NutAssembly(SingleArmEnv):
         # information of objects
         self.object_site_ids = [self.sim.model.site_name2id(nut.important_sites["handle"]) for nut in self.nuts]
 
-        # keep track of which objects are on their corresponding pegs
-        self.objects_on_pegs = np.zeros(len(self.nuts))
+        # keep track of which objects are on their corresponding pegs.
+        # Under warp we carry a per-env (num_envs, n_nuts) bool tensor on
+        # device; upstream consumers (e.g. mimicgen env_interfaces) run on
+        # CPU paths and see the 1D numpy layout unchanged.
+        if isinstance(self.sim, MjSimWarp):
+            self.objects_on_pegs = torch.zeros(
+                (self.num_envs, len(self.nuts)),
+                dtype=torch.bool,
+                device="cuda",
+            )
+        else:
+            self.objects_on_pegs = np.zeros(len(self.nuts))
 
     def _setup_observables(self):
         """
@@ -503,11 +527,13 @@ class NutAssembly(SingleArmEnv):
             # for conversion to relative gripper frame
             @sensor(modality=modality)
             def world_pose_in_gripper(obs_cache):
-                return (
-                    T.pose_inv(T.pose2mat((obs_cache[f"{pf}eef_pos"], obs_cache[f"{pf}eef_quat"])))
-                    if f"{pf}eef_pos" in obs_cache and f"{pf}eef_quat" in obs_cache
-                    else np.eye(4)
-                )
+                if f"{pf}eef_pos" not in obs_cache or f"{pf}eef_quat" not in obs_cache:
+                    return np.eye(4)
+                eef_pos = obs_cache[f"{pf}eef_pos"]
+                eef_quat = obs_cache[f"{pf}eef_quat"]
+                if isinstance(self.sim, MjSimWarp):
+                    return T.pose_inv_torch(T.pose2mat_torch(eef_pos, eef_quat))
+                return T.pose_inv(T.pose2mat((eef_pos, eef_quat)))
 
             sensors = [world_pose_in_gripper]
             names = ["world_pose_in_gripper"]
@@ -566,19 +592,37 @@ class NutAssembly(SingleArmEnv):
 
         @sensor(modality=modality)
         def nut_pos(obs_cache):
+            if isinstance(self.sim, MjSimWarp):
+                return self.sim.data.body_xpos[self.obj_body_id[nut_name]]  # (N, 3)
             return np.array(self.sim.data.body_xpos[self.obj_body_id[nut_name]])
 
         @sensor(modality=modality)
         def nut_quat(obs_cache):
+            if isinstance(self.sim, MjSimWarp):
+                # (N, 4) wxyz → xyzw via last-axis reorder.
+                q = self.sim.data.body_xquat[self.obj_body_id[nut_name]]
+                return q[..., [1, 2, 3, 0]]
             return T.convert_quat(self.sim.data.body_xquat[self.obj_body_id[nut_name]], to="xyzw")
 
         @sensor(modality=modality)
         def nut_to_eef_pos(obs_cache):
-            # Immediately return default value if cache is empty
             if any(
                 [name not in obs_cache for name in [f"{nut_name}_pos", f"{nut_name}_quat", "world_pose_in_gripper"]]
             ):
+                if isinstance(self.sim, MjSimWarp):
+                    return torch.zeros(
+                        self.num_envs, 3, dtype=torch.float32,
+                        device="cuda",
+                    )
                 return np.zeros(3)
+            if isinstance(self.sim, MjSimWarp):
+                obj_pos_t = obs_cache[f"{nut_name}_pos"]  # (N, 3)
+                obj_quat_t = obs_cache[f"{nut_name}_quat"]  # (N, 4) xyzw
+                world_poses = obs_cache["world_pose_in_gripper"]  # (N, 4, 4)
+                obj_pose = T.pose2mat_torch(obj_pos_t, obj_quat_t)
+                rel_pose = world_poses @ obj_pose
+                obs_cache[f"{nut_name}_to_{pf}eef_quat"] = T.mat2quat_torch(rel_pose[:, :3, :3])
+                return rel_pose[:, :3, 3]
             obj_pose = T.pose2mat((obs_cache[f"{nut_name}_pos"], obs_cache[f"{nut_name}_quat"]))
             rel_pose = T.pose_in_A_to_pose_in_B(obj_pose, obs_cache["world_pose_in_gripper"])
             rel_pos, rel_quat = T.mat2pose(rel_pose)
@@ -587,9 +631,14 @@ class NutAssembly(SingleArmEnv):
 
         @sensor(modality=modality)
         def nut_to_eef_quat(obs_cache):
-            return (
-                obs_cache[f"{nut_name}_to_{pf}eef_quat"] if f"{nut_name}_to_{pf}eef_quat" in obs_cache else np.zeros(4)
-            )
+            if f"{nut_name}_to_{pf}eef_quat" in obs_cache:
+                return obs_cache[f"{nut_name}_to_{pf}eef_quat"]
+            if isinstance(self.sim, MjSimWarp):
+                return torch.zeros(
+                    self.num_envs, 4, dtype=torch.float32,
+                    device="cuda",
+                )
+            return np.zeros(4)
 
         sensors = [nut_pos, nut_quat, nut_to_eef_pos, nut_to_eef_quat]
         names = [f"{nut_name}_pos", f"{nut_name}_quat", f"{nut_name}_to_{pf}eef_pos", f"{nut_name}_to_{pf}eef_quat"]
@@ -604,23 +653,46 @@ class NutAssembly(SingleArmEnv):
 
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
+            if self.use_warp:
+                import warp as wp
 
-            # Sample from the placement initializer for all objects
-            object_placements = self.placement_initializer.sample()
+                assert isinstance(self.sim, MjSimWarp)
 
-            # Loop through all objects and reset their positions
-            for obj_pos, obj_quat, obj in object_placements.values():
-                if self.use_warp:
-                    import warp as wp
-                    from robosuite.utils.binding_utils import MjSimWarp
-                    assert isinstance(self.sim, MjSimWarp)
-                    _val = np.array([*obj_pos, *obj_quat], dtype=np.float32)
-                    _val_batch = np.tile(_val, (self.num_envs, 1))
-                    self.sim.data.set_joint_qpos(
-                        obj.joints[0],
-                        wp.from_numpy(_val_batch, device=self.sim._warp_data.qpos.device),
-                    )
+                # Scope per-env resets to ``_reset_env_mask`` so kept envs'
+                # nut qpos flows through untouched. A full-batch
+                # ``set_joint_qpos`` would broadcast a single placement to
+                # every env and clobber the kept rows — see the "Masked
+                # qpos writes" working-notes entry.
+                mask = getattr(self, "_reset_env_mask", None)
+                if mask is None:
+                    sample_idxs_arr = np.arange(self.num_envs)
+                elif isinstance(mask, torch.Tensor):
+                    sample_idxs_arr = mask.nonzero().flatten().cpu().numpy()
                 else:
+                    sample_idxs_arr = np.asarray(mask).nonzero()[0]
+
+                if sample_idxs_arr.size > 0:
+                    k = int(sample_idxs_arr.size)
+                    placements = self.placement_initializer.sample_batch(k)
+                    qpos_t = wp.to_torch(self.sim._warp_data.qpos)
+                    row_idx = torch.as_tensor(
+                        sample_idxs_arr, device=qpos_t.device, dtype=torch.long
+                    )
+                    for obj_pos, obj_quat, obj in placements.values():
+                        addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
+                        start, end = addr if isinstance(addr, tuple) else (addr, addr + 1)
+                        stacked = np.concatenate(
+                            [obj_pos.astype(np.float32), obj_quat.astype(np.float32)], axis=-1
+                        )  # (k, 7)
+                        qpos_t[row_idx, start:end] = torch.as_tensor(
+                            stacked, device=qpos_t.device, dtype=torch.float32
+                        )
+            else:
+                # Sample from the placement initializer for all objects
+                object_placements = self.placement_initializer.sample()
+
+                # Loop through all objects and reset their positions
+                for obj_pos, obj_quat, obj in object_placements.values():
                     self.sim.data.set_joint_qpos(obj.joints[0], np.concatenate([np.array(obj_pos), np.array(obj_quat)]))
 
         # Move objects out of the scene depending on the mode
@@ -647,11 +719,24 @@ class NutAssembly(SingleArmEnv):
 
     def _check_success(self):
         """
-        Check if all nuts have been successfully placed around their corresponding pegs.
+        Check if all nuts have been successfully placed around their
+        corresponding pegs.
 
-        Returns:
-            bool: True if all nuts are placed correctly
+        Returns a scalar ``bool`` under CPU sims and a ``(num_envs,)`` bool
+        tensor under warp.
         """
+        if isinstance(self.sim, MjSimWarp):
+            gripper_site_pos = self.sim.data.site_xpos[self.robots[0].eef_site_id]  # (N, 3)
+            for i, nut in enumerate(self.nuts):
+                obj_pos = self.sim.data.body_xpos[self.obj_body_id[nut.name]]  # (N, 3)
+                dist = torch.linalg.vector_norm(gripper_site_pos - obj_pos, dim=-1)  # (N,)
+                r_reach = 1.0 - torch.tanh(10.0 * dist)
+                self.objects_on_pegs[:, i] = self.on_peg(obj_pos, i) & (r_reach < 0.6)
+
+            if self.single_object_mode > 0:
+                return self.objects_on_pegs.any(dim=-1)
+            return self.objects_on_pegs.all(dim=-1)
+
         # remember objects that are on the correct pegs
         gripper_site_pos = self.sim.data.site_xpos[self.robots[0].eef_site_id]
         for i, nut in enumerate(self.nuts):
@@ -666,6 +751,40 @@ class NutAssembly(SingleArmEnv):
 
         # returns True if all objects are on correct pegs
         return np.sum(self.objects_on_pegs) == len(self.nuts)
+
+    # ------------------------------------------------------------------
+    # Early-termination hook
+    # ------------------------------------------------------------------
+
+    def _fall_off_tracked_objects(self) -> tuple[str, ...]:
+        """Nut names monitored by the fall-off check."""
+        if self.single_object_mode in (1, 2):
+            # Only the active nut is in play; the others live at (10,10,10).
+            return (self.nuts[self.nut_id].name,) if hasattr(self, "nut_id") else tuple()
+        return tuple(nut.name for nut in self.nuts)
+
+    def _check_early_termination(self):
+        """Flag envs where any tracked nut has dropped below the table.
+
+        Threshold is ``table_offset[2] - fall_off_z_margin``; gated by
+        ``fall_off_termination`` so BC eval / demo-gen keep the original
+        (no-termination) behaviour unless explicitly opted in. Returns a
+        dict keyed by ``fell_off_<obj>`` so each nut's fall-off rate gets
+        its own telemetry bucket.
+        """
+        try:
+            extras = super()._check_early_termination()
+        except AttributeError:
+            extras = {}
+        if not self.fall_off_termination:
+            return extras
+        threshold = float(self.table_offset[2]) - float(self.fall_off_z_margin)
+        for obj_name in self._fall_off_tracked_objects():
+            if obj_name not in self.obj_body_id:
+                continue
+            pos = self.sim.data.body_xpos[self.obj_body_id[obj_name]]  # (..., 3)
+            extras[f"fell_off_{obj_name}"] = pos[..., 2] < threshold
+        return extras
 
     def visualize(self, vis_settings):
         """
