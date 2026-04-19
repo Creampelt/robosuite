@@ -1833,6 +1833,12 @@ class MjSimWarp(MjSim):
         self._graph_steps_done: int = 0
         self._step_graph = None
 
+        # Contact-group query state (built lazily on first check_contact_groups
+        # call). mask cache is keyed by frozenset(geom_ids); scratch output
+        # buffer is reused across calls to keep graph-capture-friendly.
+        self._geom_mask_cache: dict[frozenset, "wp.array"] = {}
+        self._contact_group_out: "wp.array | None" = None
+
     # ------------------------------------------------------------------
     # Factory methods
     # ------------------------------------------------------------------
@@ -1932,6 +1938,69 @@ class MjSimWarp(MjSim):
         with self._wp.ScopedCapture() as cap:
             self._mjwarp.step(self._warp_model, self._warp_data)
         self._step_graph = cap.graph
+
+    # ------------------------------------------------------------------
+    # Contact-group queries
+    # ------------------------------------------------------------------
+
+    def _get_or_build_geom_mask(self, geom_ids: "Iterable[int]") -> "wp.array":
+        key = frozenset(int(g) for g in geom_ids)
+        mask = self._geom_mask_cache.get(key)
+        if mask is None:
+            from robosuite.utils.warp_contact import build_geom_mask
+
+            mask = build_geom_mask(self.model.ngeom, key, self._warp_data.qpos.device)
+            self._geom_mask_cache[key] = mask
+        return mask
+
+    def check_contact_groups(
+        self,
+        geoms_a: "Iterable[int]",
+        geoms_b: "Optional[Iterable[int]]" = None,
+    ) -> "torch.Tensor":
+        """
+        Per-env check for a contact between geom group *A* and group *B*.
+
+        Args:
+            geoms_a: iterable of geom ids forming group A.
+            geoms_b: iterable of geom ids forming group B, or ``None`` to
+                match any contact involving a geom in *A*.
+
+        Returns:
+            ``torch.Tensor`` of shape ``(num_envs,)``, dtype ``bool``, on CUDA.
+            ``out[w]`` is ``True`` iff world ``w`` has at least one active
+            contact slot with ``geom1 ∈ A`` and ``geom2 ∈ B`` (symmetric).
+
+        Semantics match :func:`robosuite.utils.sim_utils.check_contact` — any
+        contact in mujoco-warp's active list counts, regardless of
+        penetration depth.
+
+        Silent-overflow caveat: if the total number of active contacts across
+        all worlds exceeds ``naconmax = naconmax_per_env * num_envs``,
+        mujoco-warp drops the overflow. Tune ``naconmax_per_env`` for the
+        task (see :mod:`rl_mimicgen.rsl_rl.warp_buffer_sizes`).
+        """
+        from robosuite.utils.warp_contact import launch_contact_group_kernel
+
+        mask_a = self._get_or_build_geom_mask(geoms_a)
+        mask_b = None if geoms_b is None else self._get_or_build_geom_mask(geoms_b)
+
+        if self._contact_group_out is None:
+            self._contact_group_out = self._wp.zeros(
+                self.num_envs, dtype=self._wp.int32, device=self._warp_data.qpos.device
+            )
+
+        launch_contact_group_kernel(
+            self._warp_data,
+            self.num_envs,
+            mask_a,
+            mask_b,
+            self._contact_group_out,
+        )
+
+        import torch
+
+        return self._wp.to_torch(self._contact_group_out).to(torch.bool)
 
     # ------------------------------------------------------------------
     # State management

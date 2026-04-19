@@ -527,9 +527,13 @@ class RobotEnv(MujocoEnv):
         # Reset action dim
         self._action_dim = 0
 
-        # Reset robot and update action space dimension along the way
+        # Reset robot and update action space dimension along the way.
+        # ``_skip_robot_reset`` lets an outer wrapper (e.g. RobomimicVecEnv's
+        # slim per-env reset) write masked robot qpos itself and avoid the
+        # full-batch arm/gripper init_qpos broadcast + controller rebuild.
         for robot in self.robots:
-            robot.reset(deterministic=self.deterministic_reset)
+            if not getattr(self, "_skip_robot_reset", False):
+                robot.reset(deterministic=self.deterministic_reset)
             self._action_dim += robot.action_dim
 
         # Update cameras if appropriate

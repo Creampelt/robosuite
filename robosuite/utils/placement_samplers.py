@@ -302,6 +302,196 @@ class UniformRandomSampler(ObjectPositionSampler):
 
         return placed_objects
 
+    def sample_batch(
+        self,
+        n: int,
+        fixtures: dict | None = None,
+        reference=None,
+        on_top: bool = True,
+    ) -> dict:
+        """Batched variant of :meth:`sample` for ``n`` independent envs.
+
+        Returns a dict with the same structure as ``sample()`` except pos is a
+        ``(n, 3)`` array and quat is a ``(n, 4)`` array (wxyz). Fixture entries
+        passed in as scalar ``(pos3, quat4, obj)`` are broadcast to batched
+        shape for use in the per-row valid-placement check.
+
+        Semantics match ``sample()`` row-for-row. Rejection sampling is
+        vectorised: at each iteration only the still-invalid rows resample,
+        so this runs in 1-2 iterations for well-separated ranges.
+
+        Raises:
+            RandomizationError: if any row still has an invalid placement
+                after 5000 iterations.
+        """
+        placed_objects: dict = {} if fixtures is None else self._broadcast_fixtures(fixtures, n)
+        if reference is None:
+            base_offset = np.asarray(self.reference_pos, dtype=np.float64)
+            base_offset = np.broadcast_to(base_offset, (n, 3)).copy()
+        elif type(reference) is str:
+            assert (
+                reference in placed_objects
+            ), "Invalid reference received. Current options are: {}, requested: {}".format(
+                placed_objects.keys(), reference
+            )
+            ref_pos, _, ref_obj = placed_objects[reference]
+            base_offset = np.asarray(ref_pos, dtype=np.float64).copy()
+            if base_offset.shape == (3,):
+                base_offset = np.broadcast_to(base_offset, (n, 3)).copy()
+            if on_top:
+                base_offset[:, 2] += ref_obj.top_offset[-1]
+        else:
+            base_offset = np.asarray(reference, dtype=np.float64)
+            assert (
+                base_offset.shape[-1] == 3
+            ), "Invalid reference received. Should be (x,y,z), but got shape: {}".format(base_offset.shape)
+            if base_offset.shape == (3,):
+                base_offset = np.broadcast_to(base_offset, (n, 3)).copy()
+
+        out: dict = dict(placed_objects)
+        for obj in self.mujoco_objects:
+            assert obj.name not in out, "Object '{}' has already been sampled!".format(obj.name)
+
+            horizontal_radius = obj.horizontal_radius
+            bottom_offset = obj.bottom_offset
+
+            x_min, x_max = self.x_range
+            y_min, y_max = self.y_range
+            if self.ensure_object_boundary_in_range:
+                x_min += horizontal_radius
+                x_max -= horizontal_radius
+                y_min += horizontal_radius
+                y_max -= horizontal_radius
+
+            pos = np.empty((n, 3), dtype=np.float64)
+            pos[:, 0] = np.random.uniform(low=x_min, high=x_max, size=n) + base_offset[:, 0]
+            pos[:, 1] = np.random.uniform(low=y_min, high=y_max, size=n) + base_offset[:, 1]
+            pos[:, 2] = self.z_offset + base_offset[:, 2]
+            if on_top:
+                pos[:, 2] -= bottom_offset[-1]
+
+            invalid = np.zeros(n, dtype=bool)
+            if self.ensure_valid_placement and out:
+                invalid = self._compute_overlap_mask(pos, out, horizontal_radius, bottom_offset)
+
+            # Rejection resample only the still-invalid rows. In practice the
+            # first pass clears nearly all of them (Coffee's machine/pod ranges
+            # don't overlap), so this loop runs 0-1 times.
+            for _ in range(5000):
+                if not invalid.any():
+                    break
+                m = invalid
+                k = int(m.sum())
+                pos[m, 0] = np.random.uniform(low=x_min, high=x_max, size=k) + base_offset[m, 0]
+                pos[m, 1] = np.random.uniform(low=y_min, high=y_max, size=k) + base_offset[m, 1]
+                invalid = self._compute_overlap_mask(pos, out, horizontal_radius, bottom_offset)
+            else:
+                if invalid.any():
+                    raise RandomizationError(
+                        f"Cannot place '{obj.name}' for {int(invalid.sum())}/{n} envs"
+                    )
+
+            quat = self._sample_quat_batch(n)
+            if hasattr(obj, "init_quat"):
+                quat = _quat_multiply_batch(quat, np.asarray(obj.init_quat, dtype=np.float64))
+
+            out[obj.name] = (pos, quat, obj)
+
+        return out
+
+    @staticmethod
+    def _broadcast_fixtures(fixtures: dict, n: int) -> dict:
+        """Broadcast any scalar (pos3, quat4) fixture entries up to (n, …)."""
+        bc: dict = {}
+        for k, (pos, quat, obj) in fixtures.items():
+            pos = np.asarray(pos, dtype=np.float64)
+            quat = np.asarray(quat, dtype=np.float64)
+            if pos.ndim == 1:
+                pos = np.broadcast_to(pos, (n, 3)).copy()
+            if quat.ndim == 1:
+                quat = np.broadcast_to(quat, (n, 4)).copy()
+            bc[k] = (pos, quat, obj)
+        return bc
+
+    @staticmethod
+    def _compute_overlap_mask(
+        pos: np.ndarray,
+        placed: dict,
+        horizontal_radius: float,
+        bottom_offset: np.ndarray,
+    ) -> np.ndarray:
+        """Return a bool mask of rows whose candidate ``pos`` overlaps any
+        already-placed (batched) object, matching the scalar valid-placement
+        test in :meth:`sample`."""
+        invalid = np.zeros(pos.shape[0], dtype=bool)
+        for other_pos, _, other_obj in placed.values():
+            if other_pos.ndim == 1:
+                other_pos = np.broadcast_to(other_pos, pos.shape)
+            dxy = pos[:, :2] - other_pos[:, :2]
+            hdist = np.linalg.norm(dxy, axis=-1)
+            dz = pos[:, 2] - other_pos[:, 2]
+            overlap = (hdist <= other_obj.horizontal_radius + horizontal_radius) & (
+                dz <= other_obj.top_offset[-1] - bottom_offset[-1]
+            )
+            invalid |= overlap
+        return invalid
+
+    def _sample_quat_batch(self, n: int) -> np.ndarray:
+        """Batched wxyz quaternion sampler matching :meth:`_sample_quat`."""
+        if self.rotation is None:
+            rot_angle = np.random.uniform(low=0.0, high=2 * np.pi, size=n)
+        elif isinstance(self.rotation, collections.abc.Iterable):
+            rot_angle = np.random.uniform(
+                low=min(self.rotation), high=max(self.rotation), size=n
+            )
+        else:
+            rot_angle = np.full(n, float(self.rotation))
+
+        c = np.cos(rot_angle / 2.0)
+        s = np.sin(rot_angle / 2.0)
+        quat = np.zeros((n, 4), dtype=np.float64)
+        quat[:, 0] = c  # w
+        if self.rotation_axis == "x":
+            quat[:, 1] = s
+        elif self.rotation_axis == "y":
+            quat[:, 2] = s
+        elif self.rotation_axis == "z":
+            quat[:, 3] = s
+        else:
+            raise ValueError(
+                "Invalid rotation axis specified. Must be 'x', 'y', or 'z'. Got: {}".format(
+                    self.rotation_axis
+                )
+            )
+        return quat
+
+
+def _quat_multiply_batch(q1: np.ndarray, q0: np.ndarray) -> np.ndarray:
+    """Batched version of ``robosuite.utils.transform_utils.quat_multiply``.
+
+    Mirrors the scalar function's element ordering bit-for-bit (it labels the
+    input indices as ``(x, y, z, w)`` and outputs the corresponding composition).
+    Accepts any broadcast-compatible combination of ``(n, 4)`` and ``(4,)``
+    inputs, returns ``(n, 4)``.
+    """
+    q1a = np.asarray(q1, dtype=np.float64)
+    q0a = np.asarray(q0, dtype=np.float64)
+    if q1a.ndim == 1:
+        q1a = q1a[None, :]
+    if q0a.ndim == 1:
+        q0a = q0a[None, :]
+    n = max(q1a.shape[0], q0a.shape[0])
+    q1a = np.broadcast_to(q1a, (n, 4))
+    q0a = np.broadcast_to(q0a, (n, 4))
+    x1, y1, z1, w1 = q1a[:, 0], q1a[:, 1], q1a[:, 2], q1a[:, 3]
+    x0, y0, z0, w0 = q0a[:, 0], q0a[:, 1], q0a[:, 2], q0a[:, 3]
+    out = np.empty((n, 4), dtype=np.float64)
+    out[:, 0] = x1 * w0 + y1 * z0 - z1 * y0 + w1 * x0
+    out[:, 1] = -x1 * z0 + y1 * w0 + z1 * x0 + w1 * y0
+    out[:, 2] = x1 * y0 - y1 * x0 + z1 * w0 + w1 * z0
+    out[:, 3] = -x1 * x0 - y1 * y0 - z1 * z0 + w1 * w0
+    return out
+
 
 class SequentialCompositeSampler(ObjectPositionSampler):
     """
@@ -438,4 +628,29 @@ class SequentialCompositeSampler(ObjectPositionSampler):
             # Update placements
             placed_objects.update(new_placements)
 
+        return placed_objects
+
+    def sample_batch(
+        self,
+        n: int,
+        fixtures: dict | None = None,
+        reference=None,
+        on_top: bool = True,
+    ) -> dict:
+        """Batched composite sample for ``n`` envs. See
+        :meth:`UniformRandomSampler.sample_batch`.
+        """
+        placed_objects: dict = {} if fixtures is None else UniformRandomSampler._broadcast_fixtures(fixtures, n)
+        for sampler, s_args in zip(self.samplers.values(), self.sample_args.values()):
+            if s_args is None:
+                s_args = {}
+            for arg_name, arg in zip(("reference", "on_top"), (reference, on_top)):
+                if arg_name not in s_args:
+                    s_args[arg_name] = arg
+            if not hasattr(sampler, "sample_batch"):
+                raise NotImplementedError(
+                    f"sample_batch not implemented on sub-sampler {type(sampler).__name__}"
+                )
+            new_placements = sampler.sample_batch(n, fixtures=placed_objects, **s_args)
+            placed_objects.update(new_placements)
         return placed_objects
