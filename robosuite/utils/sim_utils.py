@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import warp as wp
 
 
-def np_to_warp(np_arr: np.ndarray, template: "wp.array") -> "wp.array":
+def np_to_warp(np_arr: np.ndarray, template: wp.array) -> wp.array:
     """
     Convert a numpy array into a warp array whose dtype and device match *template*.
 

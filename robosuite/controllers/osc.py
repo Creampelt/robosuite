@@ -287,7 +287,7 @@ class OperationalSpaceController(Controller):
                 # Mask: per-env flag for whether the ori delta is non-zero.
                 nonzero_ori = (ax_ang.abs() > 0).any(dim=-1)          # (B,)
                 rot_err = T.quat2mat_torch(T.axisangle2quat_torch(ax_ang))  # (B, 3, 3)
-                new_goal_ori = rot_err @ self.ee_ori_mat               # (B, 3, 3) — updated goal
+                new_goal_ori = rot_err @ self.ee_ori_mat               # (B, 3, 3) -- updated goal
                 # For envs with zero delta, keep the previous goal (or fall back to current ee_ori).
                 if isinstance(self.goal_ori, torch.Tensor):
                     prev_goal_ori = self.goal_ori
@@ -405,14 +405,12 @@ class OperationalSpaceController(Controller):
         return self.torques
 
     def _run_controller_warp(self) -> torch.Tensor:
-        """Batched OSC torque computation for warp — stays entirely in torch on CUDA."""
+        """Batched OSC torque computation for warp -- stays entirely in torch on CUDA."""
         dev = self.mass_matrix.device
         dtype = self.mass_matrix.dtype
 
-        # Per-policy-step cache: opspace matrices and numpy→GPU conversions are
-        # recomputed only once per policy step (when Jacobians/mass matrix are fresh)
-        # and reused for all 25 substeps.  set_goal() sets _warp_opspace_valid=False
-        # so the first substep always recomputes.
+        # Opspace matrices + np->GPU conversions cached per policy step; set_goal
+        # clears _warp_opspace_valid so first substep rebuilds.
         if not getattr(self, '_warp_opspace_valid', False):
             # Substep 1: state was just read by update() inside set_goal() after
             # kinematics_forward() ran.  Cache goals, gains, and opspace matrices.
@@ -423,19 +421,17 @@ class OperationalSpaceController(Controller):
             self._kp_t = torch.as_tensor(self.kp, device=dev, dtype=dtype)
             self._kd_t = torch.as_tensor(self.kd, device=dev, dtype=dtype)
             self._initial_joint_t = torch.as_tensor(self.initial_joint, device=dev, dtype=dtype)
-            # Opspace matrices depend only on Jacobians and mass matrix — both held
-            # constant for the full policy step — so compute once and cache.
+            # Opspace matrices depend only on Jacobians and mass matrix -- both held
+            # constant for the full policy step -- so compute once and cache.
             self._lambda_full, self._lambda_pos, self._lambda_ori, self._nullspace_matrix = \
                 opspace_matrices_torch(self.mass_matrix, self.J_full, self.J_pos, self.J_ori)
             self._J_full_t = self.J_full  # already a GPU tensor; store alias for clarity
             self._warp_opspace_valid = True
         else:
-            # Substeps 2-25: read fresh positions/velocities from warp data.
-            # kinematics_forward() has already run for this substep (in base.py's
-            # substep loop), so site_xpos / qpos / qvel are current.
+            # Substeps 2+: kinematics_forward ran in base.py loop, so state is fresh.
             self.partial_update_warp()
 
-        # Errors: (B, 3) — positions/velocities are fresh for this substep.
+        # Errors: (B, 3) -- positions/velocities are fresh for this substep.
         pos_error = self._goal_pos_t - self.ee_pos
         ori_error = orientation_error_torch(self._goal_ori_t, self.ee_ori_mat)
 

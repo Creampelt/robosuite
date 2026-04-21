@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 from copy import copy
 
@@ -374,9 +376,7 @@ class UniformRandomSampler(ObjectPositionSampler):
             if self.ensure_valid_placement and out:
                 invalid = self._compute_overlap_mask(pos, out, horizontal_radius, bottom_offset)
 
-            # Rejection resample only the still-invalid rows. In practice the
-            # first pass clears nearly all of them (Coffee's machine/pod ranges
-            # don't overlap), so this loop runs 0-1 times.
+            # Row-level rejection; typically 0-1 iterations on non-overlapping ranges.
             for _ in range(5000):
                 if not invalid.any():
                     break
@@ -401,7 +401,7 @@ class UniformRandomSampler(ObjectPositionSampler):
 
     @staticmethod
     def _broadcast_fixtures(fixtures: dict, n: int) -> dict:
-        """Broadcast any scalar (pos3, quat4) fixture entries up to (n, …)."""
+        """Broadcast any scalar (pos3, quat4) fixture entries up to (n, ...)."""
         bc: dict = {}
         for k, (pos, quat, obj) in fixtures.items():
             pos = np.asarray(pos, dtype=np.float64)

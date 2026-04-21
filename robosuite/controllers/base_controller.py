@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import abc
 from collections.abc import Iterable
 
@@ -166,11 +168,9 @@ class Controller(object, metaclass=abc.ABCMeta):
                 self.joint_pos = self.sim.data.qpos[self.qpos_index]  # (num_envs, ndof)
                 self.joint_vel = self.sim.data.qvel[self.qvel_index]  # (num_envs, ndof)
 
-                # Jacobians: single kernel call returns both position and rotation Jacs.
-                # Cache full (all-nv) Jacobians so partial_update_warp() can compute
-                # velocities cheaply without re-launching the Jacobian kernel.
+                # Cache full-nv Jacs so partial_update_warp skips the jac kernel relaunch.
                 J_pos_full, J_ori_full = self.sim.data.get_site_jacs(self.eef_name)  # (B, 3, nv)
-                self._J_pos_full = J_pos_full  # (num_envs, 3, nv) — cached for velocity use
+                self._J_pos_full = J_pos_full  # (num_envs, 3, nv) -- cached for velocity use
                 self._J_ori_full = J_ori_full  # (num_envs, 3, nv)
                 # Stacked (6, nv) Jacobian for single-bmm velocity computation in partial_update_warp().
                 self._J_vel = torch.cat([J_pos_full, J_ori_full], dim=1)  # (num_envs, 6, nv)
@@ -178,21 +178,16 @@ class Controller(object, metaclass=abc.ABCMeta):
                 self.J_ori = J_ori_full[:, :, self.qvel_index]    # (num_envs, 3, ndof)
                 self.J_full = torch.cat([self.J_pos, self.J_ori], dim=1)  # (num_envs, 6, ndof)
 
-                # Velocities from Jacobians × qvel — one bmm using the stacked Jacobian.
+                # Velocities from Jacobians x qvel -- one bmm using the stacked Jacobian.
                 qvel_full = self.sim.data.qvel.tensor              # (num_envs, nv)
                 vel_both = torch.bmm(self._J_vel, qvel_full.unsqueeze(-1)).squeeze(-1)  # (B, 6)
                 self.ee_pos_vel = vel_both[:, :3]                  # (B, 3)
                 self.ee_ori_vel = vel_both[:, 3:]                  # (B, 3)
 
-                # Mass matrix: read directly from the dense GPU tensor — no CPU round-trip.
-                # sim.data.qM has shape (num_envs, padded_nv, padded_nv); the top-left
-                # nv × nv block is the full symmetric mass matrix (already expanded).
+                # qM top-left nvxnv is the dense symmetric mass matrix; sub-index per env,
+                # not env-0 only -- mass matrix is config-dependent and broadcasting destabilises.
                 nv = self.sim.model.nv
                 qM_full = self.sim.data.qM  # (num_envs, padded_nv, padded_nv)
-                # Per-env mass matrix, subsetted to this controller's DOFs.
-                # Using per-env (not just env 0) is essential: the mass matrix depends on
-                # joint configuration, and using env 0's matrix for other envs produces
-                # wrong torques that destabilise environments with different configs.
                 mm_sub = qM_full[:, :nv, :nv][:, self.qvel_index, :][:, :, self.qvel_index]
                 self.mass_matrix = mm_sub.float()  # (num_envs, ndof, ndof)
             else:
@@ -232,7 +227,7 @@ class Controller(object, metaclass=abc.ABCMeta):
         from the beginning of the policy step; they change slowly enough at 500 Hz
         that this approximation is accurate.
 
-        Only called from :meth:`OSCController._run_controller_warp` on substeps 2–25.
+        Only called from :meth:`OSCController._run_controller_warp` on substeps 2-25.
         """
         import torch
 
@@ -283,11 +278,8 @@ class Controller(object, metaclass=abc.ABCMeta):
         env 0 to CPU.
         """
         if isinstance(self.sim, MjSimWarp):
-            # self.joint_pos is already sliced to qpos_index (shape
-            # (num_envs, ndof)); double-indexing with qpos_index would be
-            # out-of-bounds for any task whose arm joints don't start at
-            # global qpos index 0 (e.g. HammerCleanup with a drawer slide
-            # joint before the arm).
+            # joint_pos already sliced to qpos_index; double-index is OOB for tasks
+            # whose arm joints don't start at global qpos[0] (e.g. HammerCleanup drawer).
             joint = self.joint_pos[0].cpu().numpy()
             ee_pos = self.ee_pos[0].cpu().numpy()
             ee_ori_mat = self.ee_ori_mat[0].cpu().numpy()

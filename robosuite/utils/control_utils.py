@@ -271,7 +271,7 @@ def opspace_matrices_torch(
     """Batched torch version of opspace_matrices.
 
     Args:
-        mass_matrix: (B, ndof, ndof) — per-env mass matrix
+        mass_matrix: (B, ndof, ndof) -- per-env mass matrix
         J_full: (B, 6, ndof)
         J_pos: (B, 3, ndof)
         J_ori: (B, 3, ndof)
@@ -279,10 +279,8 @@ def opspace_matrices_torch(
     Returns:
         lambda_full (B, 6, 6), lambda_pos (B, 3, 3), lambda_ori (B, 3, 3), nullspace_matrix (B, ndof, ndof)
     """
-    # mass_matrix is (B, ndof, ndof) — per-env, so each env gets its own inertia tensor.
-    # pinv (not inv) so a single corrupted env — e.g. NaN/near-singular qM from a post-
-    # divergence env that hasn't been scrubbed yet — doesn't raise and take down the
-    # whole batched controller launch. Post-step obs-NaN detection resets the bad env.
+    # pinv not inv: a single NaN/near-singular qM (pre-scrub post-divergence env)
+    # would abort the batched launch; pinv tolerates it locally.
     M_inv = torch.linalg.pinv(mass_matrix, rcond=1e-6)  # (B, ndof, ndof)
 
     # rcond=1e-4 mirrors numpy's pinv rcond threshold and prevents NaN/inf when the

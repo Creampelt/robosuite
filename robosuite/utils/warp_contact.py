@@ -14,7 +14,7 @@ launch and is cached thereafter by warp.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 import numpy as np
 import warp as wp
@@ -61,7 +61,7 @@ def launch_contact_group_kernel(
     warp_data,
     num_envs: int,
     mask_a: wp.array,
-    mask_b: Optional[wp.array],
+    mask_b: wp.array | None,
     out: wp.array,
 ) -> None:
     """

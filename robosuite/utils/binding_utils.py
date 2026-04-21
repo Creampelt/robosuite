@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import os
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
@@ -200,24 +201,19 @@ class MjRenderContext:
         mujoco.mjr_uploadTexture(self.model, self.con, tex_id)
 
     def __del__(self):
-        # free mujoco rendering context and GL rendering context.
-        # Guarded because interpreter shutdown may run atexit hooks (notably
-        # eglTerminate) before this finalizer, which would otherwise raise
-        # EGL_NOT_INITIALIZED during render-context teardown.
-        try:
-            self.con.free()
-        except Exception:
-            pass
-        try:
-            self.gl_ctx.free()
-        except Exception:
-            pass
-        del self.con
-        del self.gl_ctx
-        del self.scn
-        del self.cam
-        del self.vopt
-        del self.pert
+        # Guard against atexit eglTerminate (EGL_NOT_INITIALIZED) + partial __init__.
+        for attr in ("con", "gl_ctx"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.free()
+                except Exception:
+                    pass
+        for attr in ("con", "gl_ctx", "scn", "cam", "vopt", "pert"):
+            try:
+                delattr(self, attr)
+            except AttributeError:
+                pass
 
 
 class MjRenderContextOffscreen(MjRenderContext):
@@ -1191,9 +1187,7 @@ class MjSim:
         del self
 
 
-# ---------------------------------------------------------------------------
-# MuJoCo Warp — GPU-parallelised simulation
-# ---------------------------------------------------------------------------
+# MuJoCo Warp -- GPU-parallelised simulation
 
 
 class MjDataWarp:
@@ -1206,10 +1200,10 @@ class MjDataWarp:
     supply ``warp.array`` values; they are copied directly onto the GPU without
     an intermediate CPU round-trip.
 
-    Named getters (``get_body_xpos``, ``get_joint_qpos``, …) return new
+    Named getters (``get_body_xpos``, ``get_joint_qpos``, ...) return new
     ``warp.array`` objects extracted from the relevant slice of the full batch.
 
-    Named setters (``set_joint_qpos``, ``set_mocap_pos``, …) accept
+    Named setters (``set_joint_qpos``, ``set_mocap_pos``, ...) accept
     ``warp.array`` values and write them back into the batch.
 
     .. note::
@@ -1220,7 +1214,7 @@ class MjDataWarp:
     """
 
     def __init__(
-        self, model: MjModel, warp_data: "mujoco_warp.Data", warp_model: "mujoco_warp.Model", num_envs: int
+        self, model: MjModel, warp_data: mujoco_warp.Data, warp_model: mujoco_warp.Model, num_envs: int
     ) -> None:
         """
         Args:
@@ -1233,18 +1227,16 @@ class MjDataWarp:
         self._data = warp_data
         self._warp_model = warp_model
         self.num_envs = num_envs
-        # Cache for body_wp arrays (constant per bodyid, avoids repeated CPU→GPU copies)
+        # Cache for body_wp arrays (constant per bodyid, avoids repeated CPU->GPU copies)
         self._body_wp_cache: dict = {}
 
-    # ------------------------------------------------------------------
     # Attribute delegation
-    # ------------------------------------------------------------------
 
     @property
     def model(self) -> MjModel:
         return self._model
 
-    def __getattr__(self, name: str) -> "wp.array":
+    def __getattr__(self, name: str) -> wp.array:
         """Delegate to warp data, returning the raw ``wp.array``."""
         try:
             return getattr(self._data, name)
@@ -1275,132 +1267,123 @@ class MjDataWarp:
         else:
             object.__setattr__(self, name, value)
 
-    # ------------------------------------------------------------------
-    # Zero-copy array proxies — _BatchedArray wraps wp.to_torch so that
-    # arr[i] returns (num_envs, ...) without knowing the batch dimension.
-    # Scalar arrays (qpos, qvel, qfrc_bias) are returned as raw tensors
-    # since callers already use explicit [:, idx] slicing on them.
-    # ------------------------------------------------------------------
+    # Zero-copy array proxies. Scalar arrays (qpos, qvel, qfrc_bias) stay raw
+    # tensors since callers use explicit [:, idx] slicing.
 
     @property
-    def ctrl(self) -> "_BatchedArray":
+    def ctrl(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nu)`` writable proxy."""
         return _BatchedArray(self._data.ctrl)
 
     @property
-    def body_xpos(self) -> "_BatchedArray":
+    def body_xpos(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nbody, 3)`` proxy."""
         return _BatchedArray(self._data.xpos)
 
     @property
-    def body_xquat(self) -> "_BatchedArray":
+    def body_xquat(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nbody, 4)`` proxy (wxyz convention)."""
         return _BatchedArray(self._data.xquat)
 
     @property
-    def body_xmat(self) -> "_BatchedArray":
+    def body_xmat(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nbody, 3, 3)`` proxy."""
         return _BatchedArray(self._data.xmat)
 
     @property
-    def geom_xpos(self) -> "_BatchedArray":
+    def geom_xpos(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, ngeom, 3)`` proxy."""
         return _BatchedArray(self._data.geom_xpos)
 
     @property
-    def site_xpos(self) -> "_BatchedArray":
+    def site_xpos(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nsite, 3)`` proxy."""
         return _BatchedArray(self._data.site_xpos)
 
     @property
-    def site_xmat(self) -> "_BatchedArray":
+    def site_xmat(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nsite, 3, 3)`` proxy."""
         return _BatchedArray(self._data.site_xmat)
 
     @property
-    def qpos(self) -> "_BatchedArray":
+    def qpos(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nq)`` proxy. Use ``.tensor`` for the raw tensor."""
         return _BatchedArray(self._data.qpos)
 
     @property
-    def qvel(self) -> "_BatchedArray":
+    def qvel(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nv)`` proxy. Use ``.tensor`` for the raw tensor."""
         return _BatchedArray(self._data.qvel)
 
     @property
-    def qfrc_bias(self) -> "_BatchedArray":
+    def qfrc_bias(self) -> _BatchedArray:
         """Zero-copy ``(num_envs, nv)`` proxy (gravity/Coriolis forces)."""
         return _BatchedArray(self._data.qfrc_bias)
 
     @property
-    def qM(self) -> "torch.Tensor":
+    def qM(self) -> torch.Tensor:
         """Dense mass matrix: ``(num_envs, padded_nv, padded_nv)`` CUDA float32.
 
         MuJoCo Warp stores the full symmetric mass matrix in a dense padded
-        block (padded to the next warp SIMD width).  The top-left ``nv × nv``
-        sub-block contains the actual values — no ``mj_fullM`` call required.
+        block (padded to the next warp SIMD width).  The top-left ``nv x nv``
+        sub-block contains the actual values -- no ``mj_fullM`` call required.
         """
         import warp as wp
         return wp.to_torch(self._data.qM)
 
-    # ------------------------------------------------------------------
-    # Named getters — delegate to array proxies (zero-copy)
-    # ------------------------------------------------------------------
+    # Named getters -- delegate to array proxies (zero-copy)
 
-
-    def get_body_xpos(self, name: str) -> "torch.Tensor":
+    def get_body_xpos(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` CUDA tensor."""
         return self.body_xpos[self._model.body_name2id(name)]
 
-    def get_body_xquat(self, name: str) -> "torch.Tensor":
+    def get_body_xquat(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 4)`` CUDA tensor (wxyz convention)."""
         return self.body_xquat[self._model.body_name2id(name)]
 
-    def get_body_xmat(self, name: str) -> "torch.Tensor":
+    def get_body_xmat(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, 3)`` CUDA tensor."""
         return self.body_xmat[self._model.body_name2id(name)]
 
-    def get_geom_xpos(self, name: str) -> "torch.Tensor":
+    def get_geom_xpos(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` CUDA tensor."""
         return self.geom_xpos[self._model.geom_name2id(name)]
 
-    def get_geom_xmat(self, name: str) -> "torch.Tensor":
+    def get_geom_xmat(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, 3)`` CUDA tensor."""
         import warp as wp
         gid = self._model.geom_name2id(name)
         return wp.to_torch(self._data.geom_xmat)[: , gid]
 
-    def get_site_xpos(self, name: str) -> "torch.Tensor":
+    def get_site_xpos(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` CUDA tensor."""
         return self.site_xpos[self._model.site_name2id(name)]
 
-    def get_site_xmat(self, name: str) -> "torch.Tensor":
+    def get_site_xmat(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, 3)`` CUDA tensor."""
         return self.site_xmat[self._model.site_name2id(name)]
 
-    def get_camera_xpos(self, name: str) -> "torch.Tensor":
+    def get_camera_xpos(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` CUDA tensor."""
         import warp as wp
         cid = self._model.camera_name2id(name)
         return wp.to_torch(self._data.cam_xpos)[:, cid]
 
-    def get_camera_xmat(self, name: str) -> "torch.Tensor":
+    def get_camera_xmat(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, 3)`` CUDA tensor."""
         import warp as wp
         cid = self._model.camera_name2id(name)
         return wp.to_torch(self._data.cam_xmat)[:, cid]
 
-    def get_sensor(self, name: str) -> "torch.Tensor":
+    def get_sensor(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs,)`` CUDA tensor."""
         import warp as wp
         sid = self._model.sensor_name2id(name)
         return wp.to_torch(self._data.sensordata)[:, sid]
 
-    # ------------------------------------------------------------------
     # Joint position / velocity getters and setters
-    # ------------------------------------------------------------------
 
-    def get_joint_qpos(self, name: str) -> "torch.Tensor":
+    def get_joint_qpos(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs,)`` or ``(num_envs, ndim)`` CUDA tensor."""
         import warp as wp
         addr = self._model.get_joint_qpos_addr(name)
@@ -1424,7 +1407,7 @@ class MjDataWarp:
         else:
             t[:, addr[0]:addr[1]] = val
 
-    def get_joint_qvel(self, name: str) -> "torch.Tensor":
+    def get_joint_qvel(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs,)`` or ``(num_envs, ndim)`` CUDA tensor."""
         import warp as wp
         addr = self._model.get_joint_qvel_addr(name)
@@ -1457,11 +1440,9 @@ class MjDataWarp:
         )
         wp.to_torch(self._data.qpos)[:, indexes] = val
 
-    # ------------------------------------------------------------------
     # Mocap getters and setters
-    # ------------------------------------------------------------------
 
-    def get_mocap_pos(self, name: str) -> "torch.Tensor":
+    def get_mocap_pos(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` CUDA tensor."""
         import warp as wp
         body_id = self._model.body_name2id(name)
@@ -1480,7 +1461,7 @@ class MjDataWarp:
         )
         wp.to_torch(self._data.mocap_pos)[:, mocap_id] = val
 
-    def get_mocap_quat(self, name: str) -> "torch.Tensor":
+    def get_mocap_quat(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 4)`` CUDA tensor (wxyz convention)."""
         import warp as wp
         body_id = self._model.body_name2id(name)
@@ -1499,22 +1480,11 @@ class MjDataWarp:
         )
         wp.to_torch(self._data.mocap_quat)[:, mocap_id] = val
 
-    # ------------------------------------------------------------------
-    # Jacobians — computed on GPU via mujoco_warp.jac
-    # ------------------------------------------------------------------
+    # Jacobians -- computed on GPU via mujoco_warp.jac
 
-    def _compute_jacs(self, point: "torch.Tensor", bodyid: int) -> "tuple[torch.Tensor, torch.Tensor]":
-        """
-        Compute translational and rotational Jacobians for a point on a body,
-        across all envs simultaneously on the GPU.
-
-        Args:
-            point: ``(num_envs, 3)`` CUDA float32 tensor — point in world coords per env.
-            bodyid: integer body ID (same for all envs).
-
-        Returns:
-            Tuple ``(jacp, jacr)`` each as a ``(num_envs, 3, nv)`` CUDA tensor.
-        """
+    def _compute_jacs(self, point: torch.Tensor, bodyid: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Translational + rotational Jacobians on a point per env. Returns (jacp, jacr)
+        each (num_envs, 3, nv) CUDA float32."""
         import mujoco_warp as mjwarp
         import warp as wp
 
@@ -1522,69 +1492,67 @@ class MjDataWarp:
         device = self._data.qpos.device
         jacp_wp = wp.zeros((self.num_envs, 3, nv), dtype=float, device=device)
         jacr_wp = wp.zeros((self.num_envs, 3, nv), dtype=float, device=device)
-        # Cache the body_wp array — bodyid is constant for a given site/body, so
+        # Cache the body_wp array -- bodyid is constant for a given site/body, so
         # building [bodyid]*num_envs and uploading to GPU only happens once.
         if bodyid not in self._body_wp_cache:
             self._body_wp_cache[bodyid] = wp.array(
                 [bodyid] * self.num_envs, dtype=wp.int32, device=device
             )
         body_wp = self._body_wp_cache[bodyid]
-        # Reinterpret (num_envs, 3) float32 tensor as (num_envs,) vec3f — zero-copy.
+        # Reinterpret (num_envs, 3) float32 tensor as (num_envs,) vec3f -- zero-copy.
         point_wp = wp.from_torch(point.contiguous(), dtype=wp.vec3f)
         mjwarp.jac(self._warp_model, self._data, jacp_wp, jacr_wp, point_wp, body_wp)
         return wp.to_torch(jacp_wp), wp.to_torch(jacr_wp)
 
-    def get_site_jacs(self, name: str) -> "tuple[torch.Tensor, torch.Tensor]":
+    def get_site_jacs(self, name: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(jacp, jacr)`` both as ``(num_envs, 3, nv)`` CUDA tensors in one kernel call."""
         sid = self._model.site_name2id(name)
         bid = int(self._model._model.site_bodyid[sid])
         return self._compute_jacs(self.site_xpos[sid], bid)
 
-    def get_body_jacp(self, name: str) -> "torch.Tensor":
+    def get_body_jacp(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, nv)`` position Jacobian as a zero-copy CUDA tensor."""
         bid = self._model.body_name2id(name)
         jacp, _ = self._compute_jacs(self.body_xpos[bid], bid)
         return jacp
 
-    def get_body_jacr(self, name: str) -> "torch.Tensor":
+    def get_body_jacr(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, nv)`` rotation Jacobian as a zero-copy CUDA tensor."""
         bid = self._model.body_name2id(name)
         _, jacr = self._compute_jacs(self.body_xpos[bid], bid)
         return jacr
 
-    def get_site_jacp(self, name: str) -> "torch.Tensor":
+    def get_site_jacp(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, nv)`` position Jacobian as a zero-copy CUDA tensor."""
         sid = self._model.site_name2id(name)
         bid = int(self._model._model.site_bodyid[sid])
         jacp, _ = self._compute_jacs(self.site_xpos[sid], bid)
         return jacp
 
-    def get_site_jacr(self, name: str) -> "torch.Tensor":
+    def get_site_jacr(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, nv)`` rotation Jacobian as a zero-copy CUDA tensor."""
         sid = self._model.site_name2id(name)
         bid = int(self._model._model.site_bodyid[sid])
         _, jacr = self._compute_jacs(self.site_xpos[sid], bid)
         return jacr
 
-    def get_geom_jacp(self, name: str) -> "torch.Tensor":
+    def get_geom_jacp(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, nv)`` position Jacobian as a zero-copy CUDA tensor."""
         gid = self._model.geom_name2id(name)
         bid = int(self._model._model.geom_bodyid[gid])
         jacp, _ = self._compute_jacs(self.geom_xpos[gid], bid)
         return jacp
 
-    def get_geom_jacr(self, name: str) -> "torch.Tensor":
+    def get_geom_jacr(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3, nv)`` rotation Jacobian as a zero-copy CUDA tensor."""
         gid = self._model.geom_name2id(name)
         bid = int(self._model._model.geom_bodyid[gid])
         _, jacr = self._compute_jacs(self.geom_xpos[gid], bid)
         return jacr
 
-    # ------------------------------------------------------------------
-    # Velocity getters — derived from Jacobians × qvel, shape (num_envs, 3)
-    # ------------------------------------------------------------------
+    # Velocity getters -- derived from Jacobians x qvel, shape (num_envs, 3)
 
-    def _jac_times_qvel(self, jac: "torch.Tensor") -> "torch.Tensor":
+    def _jac_times_qvel(self, jac: torch.Tensor) -> torch.Tensor:
         """Batched matrix-vector multiply: ``jac @ qvel`` per env.
 
         Args:
@@ -1597,36 +1565,36 @@ class MjDataWarp:
 
         return torch.einsum("eij,ej->ei", jac, self.qvel.tensor)
 
-    def get_body_xvelp(self, name: str) -> "torch.Tensor":
+    def get_body_xvelp(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` translational velocity for a body as a CUDA torch.Tensor."""
         return self._jac_times_qvel(self.get_body_jacp(name))
 
-    def get_body_xvelr(self, name: str) -> "torch.Tensor":
+    def get_body_xvelr(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` rotational velocity for a body as a CUDA torch.Tensor."""
         return self._jac_times_qvel(self.get_body_jacr(name))
 
-    def get_site_xvelp(self, name: str) -> "torch.Tensor":
+    def get_site_xvelp(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` translational velocity for a site as a CUDA torch.Tensor."""
         return self._jac_times_qvel(self.get_site_jacp(name))
 
-    def get_site_xvelr(self, name: str) -> "torch.Tensor":
+    def get_site_xvelr(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` rotational velocity for a site as a CUDA torch.Tensor."""
         return self._jac_times_qvel(self.get_site_jacr(name))
 
-    def get_geom_xvelp(self, name: str) -> "torch.Tensor":
+    def get_geom_xvelp(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` translational velocity for a geom as a CUDA torch.Tensor."""
         return self._jac_times_qvel(self.get_geom_jacp(name))
 
-    def get_geom_xvelr(self, name: str) -> "torch.Tensor":
+    def get_geom_xvelr(self, name: str) -> torch.Tensor:
         """Returns ``(num_envs, 3)`` rotational velocity for a geom as a CUDA torch.Tensor."""
         return self._jac_times_qvel(self.get_geom_jacr(name))
 
 
 class MjModelWarp(MjModel):
-    """MjModel subclass for warp sims — returns CUDA tensors for array properties."""
+    """MjModel subclass for warp sims -- returns CUDA tensors for array properties."""
 
     @property
-    def actuator_ctrlrange(self) -> "torch.Tensor":
+    def actuator_ctrlrange(self) -> torch.Tensor:
         """``(nu, 2)`` CUDA tensor of actuator control ranges."""
         import torch
         return torch.as_tensor(self._model.actuator_ctrlrange, dtype=torch.float32, device="cuda")
@@ -1635,27 +1603,27 @@ class MjModelWarp(MjModel):
 class _BatchedArray:
     """Zero-copy proxy for a ``(num_envs, n, ...)`` warp array.
 
-    Wraps via ``wp.to_torch`` (shared GPU memory — no copies).  Plain indexing
+    Wraps via ``wp.to_torch`` (shared GPU memory -- no copies).  Plain indexing
     is treated as column indexing across the env dimension so callers do not
     need to know about the batch dimension:
 
-        arr[i]      →  tensor[:, i]       # (num_envs, ...)
-        arr[i] = v  →  tensor[:, i] = v   # in-place, propagates to warp
-        arr.tensor  →  full (num_envs, n, ...) tensor
+        arr[i]      ->  tensor[:, i]       # (num_envs, ...)
+        arr[i] = v  ->  tensor[:, i] = v   # in-place, propagates to warp
+        arr.tensor  ->  full (num_envs, n, ...) tensor
     """
 
     __slots__ = ("_tensor",)
 
-    def __init__(self, warp_arr: "wp.array") -> None:
+    def __init__(self, warp_arr: wp.array) -> None:
         import warp as wp
-        self._tensor: "torch.Tensor" = wp.to_torch(warp_arr)
+        self._tensor: torch.Tensor = wp.to_torch(warp_arr)
 
     @property
-    def tensor(self) -> "torch.Tensor":
+    def tensor(self) -> torch.Tensor:
         """Full ``(num_envs, n, ...)`` CUDA tensor (zero-copy view)."""
         return self._tensor
 
-    def __getitem__(self, idx) -> "torch.Tensor":
+    def __getitem__(self, idx) -> torch.Tensor:
         return self._tensor[:, idx]
 
     def __setitem__(self, idx, value) -> None:
@@ -1693,50 +1661,26 @@ class MjSimWarp(MjSim):
         img = sim.render(env_idx=0, width=256, height=256)
     """
 
-    # Solver settings tuned for parallel warp rollouts. Per mujoco-warp's
-    # put_data contract: njmax and nconmax are per-world caps; naconmax is the
-    # total contact-buffer size across all worlds. ccd_iterations must be
-    # sufficient for the most complex geometry in the scene.
-    #
-    # Sizing these involves a tradeoff with num_envs:
-    #   efc.J memory  = nworld * njmax * nv_pad  (dense Jacobian, f32)
-    #   EPA scratch   = naccdmax * (440 + 164*ccd_iterations) bytes
-    # where naccdmax defaults to naconmax = _NACONMAX_PER_ENV * nworld. At very
-    # large nworld you may need to shrink these; at smaller nworld (< ~1000)
-    # the defaults here leave ample headroom.
-    #
-    # njmax is per-world: if you see "nefc overflow - please increase njmax to
-    # N", bump _NJMAX_PER_ENV above N. Mimicgen tasks (Coffee, Threading, etc.)
-    # commonly need ~3000 per world due to mesh-based collision geoms.
+    # njmax per-world; naconmax total. efc.J = nworld*njmax*nv_pad; EPA scratch =
+    # naccdmax*(440+164*ccd_iters). If "nefc overflow" fires, bump _NJMAX_PER_ENV.
     _NJMAX_PER_ENV: int = 3500
     _NCONMAX_PER_ENV: int = 128
     _NACONMAX_PER_ENV: int = 60
-    # ccd_iterations is the EPA iteration cap per contact pair. Mujoco-warp
-    # emits "Warning: opt.ccd_iterations needs to be increased" from a device
-    # kernel when EPA hits this cap without converging. Coffee's mesh pod /
-    # holder geometry hits it sometimes even at 200, but the fallback contact
-    # is close enough not to matter — we just silence the printf at the
-    # subprocess level (see run_official_dppo_mimicgen._WARP_NOISE_PATTERNS).
-    # Raising the cap nearly doubles per-step rollout time at 128 envs
-    # (measured: 22s/iter → 50s/iter at 400), so default stays 200.
-    # Override with ROBOSUITE_WARP_CCD_ITERATIONS if you want the fidelity.
+    # Raising ccd_iterations ~2x's step time at 128 envs (22s->50s/iter @ 400 its);
+    # Coffee mesh hits cap but fallback contact suffices. ROBOSUITE_WARP_CCD_ITERATIONS to override.
     _CCD_ITERATIONS: int = 200
 
-    # Currently-active per-task overrides, set by ``robosuite.make()`` when the
-    # task's env_kwargs include ``njmax_per_env`` / ``naconmax_per_env``. Read
-    # here with precedence: per-instance kwarg > active override > class default.
-    # Stored at class scope so that hard_reset rebuilds (which call
-    # ``from_xml_string`` directly rather than going through ``robosuite.make``)
-    # still pick up the task's override.
-    _ACTIVE_NJMAX_PER_ENV: Optional[int] = None
-    _ACTIVE_NACONMAX_PER_ENV: Optional[int] = None
+    # Per-task overrides set by robosuite.make from env_kwargs. Class scope so
+    # hard_reset rebuilds (which go via from_xml_string) still pick them up.
+    _ACTIVE_NJMAX_PER_ENV: int | None = None
+    _ACTIVE_NACONMAX_PER_ENV: int | None = None
 
     def __init__(
         self,
         model: mujoco.MjModel,
         num_envs: int = 1,
-        njmax_per_env: Optional[int] = None,
-        naconmax_per_env: Optional[int] = None,
+        njmax_per_env: int | None = None,
+        naconmax_per_env: int | None = None,
     ) -> None:
         """
         Args:
@@ -1757,13 +1701,7 @@ class MjSimWarp(MjSim):
         self._wp = wp
         self.num_envs: int = num_envs
 
-        # Optional env-var knobs (for benchmarking speed-vs-accuracy tradeoffs).
-        # Defaults preserve existing behaviour.
-        #   ROBOSUITE_WARP_TOLERANCE_CLAMP=1  -> accept mujoco-warp's 1e-6 clamp
-        #   ROBOSUITE_WARP_SOLVER_ITERS=<int> -> override opt.iterations
-        #   ROBOSUITE_WARP_LS_ITERS=<int>     -> override opt.ls_iterations
-        #   ROBOSUITE_WARP_CONE=pyramidal|elliptic -> override opt.cone
-        #   ROBOSUITE_WARP_CCD_ITERATIONS=<int> -> override opt.ccd_iterations
+        # ROBOSUITE_WARP_{TOLERANCE_CLAMP,SOLVER_ITERS,LS_ITERS,CONE,CCD_ITERATIONS} overrides.
         _accept_tol_clamp = os.environ.get("ROBOSUITE_WARP_TOLERANCE_CLAMP", "0") == "1"
         _solver_iters = os.environ.get("ROBOSUITE_WARP_SOLVER_ITERS")
         _ls_iters = os.environ.get("ROBOSUITE_WARP_LS_ITERS")
@@ -1781,15 +1719,11 @@ class MjSimWarp(MjSim):
         if _ls_iters is not None:
             model.opt.ls_iterations = int(_ls_iters)
 
-        # Shared model wrapper — identical for every env
+        # Shared model wrapper -- identical for every env
         self.model = MjModelWarp(model)
 
-        # Force dense constraint Jacobian + qM layout under warp. With the
-        # default mjJAC_AUTO, mujoco-warp switches to sparse at nv>32 and
-        # emits qM as (nworld, 1, nM) instead of (nworld, nv, nv). The OSC
-        # controller's mass-matrix extraction (base_controller.py) assumes
-        # dense layout; sparse layout trips a CUDA OOB on qvel_index
-        # indexing. PickPlace has nv=33 and was the first task to hit this.
+        # Force dense qM: mjJAC_AUTO switches sparse at nv>32, breaking OSC's
+        # qvel_index slicing in base_controller (PickPlace nv=33 was first hit).
         import mujoco as _mj
         if model.opt.jacobian == int(_mj.mjtJacobian.mjJAC_AUTO):
             model.opt.jacobian = int(_mj.mjtJacobian.mjJAC_DENSE)
@@ -1805,16 +1739,12 @@ class MjSimWarp(MjSim):
         if _ls_iters is not None:
             self._warp_model.opt.ls_iterations = int(_ls_iters)
 
-        # Restore the XML-specified solver tolerance. mujoco-warp's put_model
-        # unconditionally clamps to max(tolerance, 1e-6) "because f32 GPU", but
-        # for contact-heavy manipulation tasks this costs a lot of fidelity
-        # relative to mujoco-python's f64 behaviour.
+        # put_model clamps tolerance to max(..,1e-6) for f32; restore XML value
+        # since contact-heavy tasks lose fidelity vs mujoco-python's f64.
         if not _accept_tol_clamp:
             self._warp_model.opt.tolerance.fill_(float(model.opt.tolerance))
 
-        # Resolve effective buffer sizes: per-instance kwarg > class-level
-        # active override (set by robosuite.make from task env_kwargs) > class
-        # default. Stored on self for auditability.
+        # Precedence: per-instance kwarg > active override > class default.
         effective_njmax = (
             njmax_per_env
             if njmax_per_env is not None
@@ -1841,35 +1771,28 @@ class MjSimWarp(MjSim):
         self.data = MjDataWarp(self.model, self._warp_data, self._warp_model, num_envs)
         self._render_context_offscreen = None
 
-        # CUDA graph capture state (opt-in via ROBOSUITE_WARP_GRAPH=1).
-        # First N steps run eagerly so all kernels JIT-compile; next step is
-        # captured into a graph; subsequent steps replay via capture_launch.
-        # Writing to d.ctrl between launches is fine — graph captures kernel
-        # sequence, not input values. Reset and kinematics_forward are outside
-        # the captured region.
+        # CUDA graph capture (opt-in via ROBOSUITE_WARP_GRAPH=1): warmup eagerly
+        # for JIT, then capture once and replay. Reset / kinematics_forward stay out.
         self._graph_enabled: bool = os.environ.get("ROBOSUITE_WARP_GRAPH", "0") == "1"
         self._graph_warmup_steps: int = int(os.environ.get("ROBOSUITE_WARP_GRAPH_WARMUP", "3"))
         self._graph_steps_done: int = 0
         self._step_graph = None
 
-        # Contact-group query state (built lazily on first check_contact_groups
-        # call). mask cache is keyed by frozenset(geom_ids); scratch output
-        # buffer is reused across calls to keep graph-capture-friendly.
-        self._geom_mask_cache: dict[frozenset, "wp.array"] = {}
-        self._contact_group_out: "wp.array | None" = None
+        # Contact-group state: lazy mask cache keyed by frozenset(geom_ids); reused
+        # scratch buffer for graph-capture friendliness.
+        self._geom_mask_cache: dict[frozenset, wp.array] = {}
+        self._contact_group_out: wp.array | None = None
 
-    # ------------------------------------------------------------------
     # Factory methods
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_xml_string(
         cls,
         xml: str,
         num_envs: int = 1,
-        njmax_per_env: Optional[int] = None,
-        naconmax_per_env: Optional[int] = None,
-    ) -> "MjSimWarp":
+        njmax_per_env: int | None = None,
+        naconmax_per_env: int | None = None,
+    ) -> MjSimWarp:
         model = mujoco.MjModel.from_xml_string(xml)
         return cls(
             model,
@@ -1883,9 +1806,9 @@ class MjSimWarp(MjSim):
         cls,
         xml_file: str,
         num_envs: int = 1,
-        njmax_per_env: Optional[int] = None,
-        naconmax_per_env: Optional[int] = None,
-    ) -> "MjSimWarp":
+        njmax_per_env: int | None = None,
+        naconmax_per_env: int | None = None,
+    ) -> MjSimWarp:
         with open(xml_file, "r") as f:
             xml = f.read()
         return cls.from_xml_string(
@@ -1895,11 +1818,9 @@ class MjSimWarp(MjSim):
             naconmax_per_env=naconmax_per_env,
         )
 
-    # ------------------------------------------------------------------
     # Core simulation
-    # ------------------------------------------------------------------
 
-    def reset(self, env_indices: Optional[List[int]] = None) -> None:
+    def reset(self, env_indices: list[int] | None = None) -> None:
         """
         Reset simulation state for the specified envs.
 
@@ -1926,7 +1847,7 @@ class MjSimWarp(MjSim):
         This is cheaper than ``forward()`` because it skips collision detection,
         constraint making, factorisation, and the constraint solver.  It updates
         ``site_xpos``, ``site_xmat``, body positions/orientations, and ``qfrc_bias``
-        (gravity + Coriolis) — everything the OSC controller reads.  The full
+        (gravity + Coriolis) -- everything the OSC controller reads.  The full
         ``forward()`` is still called internally by ``step()``, so constraint
         accuracy is not affected.
         """
@@ -1958,11 +1879,9 @@ class MjSimWarp(MjSim):
             self._mjwarp.step(self._warp_model, self._warp_data)
         self._step_graph = cap.graph
 
-    # ------------------------------------------------------------------
     # Contact-group queries
-    # ------------------------------------------------------------------
 
-    def _get_or_build_geom_mask(self, geom_ids: "Iterable[int]") -> "wp.array":
+    def _get_or_build_geom_mask(self, geom_ids: Iterable[int]) -> wp.array:
         key = frozenset(int(g) for g in geom_ids)
         mask = self._geom_mask_cache.get(key)
         if mask is None:
@@ -1974,9 +1893,9 @@ class MjSimWarp(MjSim):
 
     def check_contact_groups(
         self,
-        geoms_a: "Iterable[int]",
-        geoms_b: "Optional[Iterable[int]]" = None,
-    ) -> "torch.Tensor":
+        geoms_a: Iterable[int],
+        geoms_b: Iterable[int] | None = None,
+    ) -> torch.Tensor:
         """
         Per-env check for a contact between geom group *A* and group *B*.
 
@@ -1988,9 +1907,9 @@ class MjSimWarp(MjSim):
         Returns:
             ``torch.Tensor`` of shape ``(num_envs,)``, dtype ``bool``, on CUDA.
             ``out[w]`` is ``True`` iff world ``w`` has at least one active
-            contact slot with ``geom1 ∈ A`` and ``geom2 ∈ B`` (symmetric).
+            contact slot with ``geom1 in A`` and ``geom2 in B`` (symmetric).
 
-        Semantics match :func:`robosuite.utils.sim_utils.check_contact` — any
+        Semantics match :func:`robosuite.utils.sim_utils.check_contact` -- any
         contact in mujoco-warp's active list counts, regardless of
         penetration depth.
 
@@ -2021,11 +1940,9 @@ class MjSimWarp(MjSim):
 
         return self._wp.to_torch(self._contact_group_out).to(torch.bool)
 
-    # ------------------------------------------------------------------
     # State management
-    # ------------------------------------------------------------------
 
-    def get_state(self, env_idx: Optional[int] = None) -> "MjSimState | List[MjSimState]":
+    def get_state(self, env_idx: int | None = None) -> MjSimState | list[MjSimState]:
         """
         Return the current simulation state.
 
@@ -2047,8 +1964,8 @@ class MjSimWarp(MjSim):
 
     def set_state(
         self,
-        value: "MjSimState | List[MjSimState]",
-        env_idx: Optional[int] = None,
+        value: MjSimState | list[MjSimState],
+        env_idx: int | None = None,
     ) -> None:
         """
         Set simulation state from one or more :class:`MjSimState` objects.
@@ -2087,7 +2004,7 @@ class MjSimWarp(MjSim):
     def set_state_from_flattened(
         self,
         value: np.ndarray,
-        env_idx: Optional[int] = None,
+        env_idx: int | None = None,
     ) -> None:
         """
         Set state from a flat ``(1 + nq + nv,)`` array, or a batch
@@ -2103,9 +2020,7 @@ class MjSimWarp(MjSim):
         else:
             self.set_state([MjSimState.from_flattened(value[i], self) for i in range(len(value))])
 
-    # ------------------------------------------------------------------
     # Single-env data extraction
-    # ------------------------------------------------------------------
 
     def get_env_data(self, env_idx: int) -> mujoco.MjData:
         """
@@ -2125,16 +2040,14 @@ class MjSimWarp(MjSim):
         self._mjwarp.get_data_into(result, self.model._model, self._warp_data, world_id=env_idx)
         return result
 
-    # ------------------------------------------------------------------
     # Rendering
-    # ------------------------------------------------------------------
 
     def render(
         self,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
+        width: int | None = None,
+        height: int | None = None,
         *,
-        camera_name: Optional[str] = None,
+        camera_name: str | None = None,
         depth: bool = False,
         mode: str = "offscreen",
         device_id: int = -1,
@@ -2176,10 +2089,6 @@ class MjSimWarp(MjSim):
                 return self._render_context_offscreen.read_pixels(width, height, depth=depth, segmentation=segmentation)
         finally:
             self._render_context_offscreen.data._data = saved_data_ptr
-
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
 
     def free(self) -> None:
         del self._render_context_offscreen

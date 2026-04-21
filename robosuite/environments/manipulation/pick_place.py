@@ -214,9 +214,7 @@ class PickPlace(SingleArmEnv):
         fall_off_termination: bool = False,
         fall_off_z_margin: float = 0.1,
     ):
-        # Early-termination when any active object drops below the bin-1
-        # surface plane minus ``fall_off_z_margin``. Gated so BC eval /
-        # demo-gen keep the no-termination behaviour unless opted in.
+        # Gated fall-off termination vs bin1_pos[2] - margin; opt-in for BC eval.
         self.fall_off_termination = fall_off_termination
         self.fall_off_z_margin = fall_off_z_margin
 
@@ -405,7 +403,7 @@ class PickPlace(SingleArmEnv):
 
         Under warp ``obj_pos`` is a ``(num_envs, 3)`` tensor; the result
         is a ``(num_envs,)`` bool tensor. Under CPU ``obj_pos`` is
-        ``(3,)`` and the result is a scalar bool — matches upstream.
+        ``(3,)`` and the result is a scalar bool -- matches upstream.
         """
         bin_x_low = self.bin2_pos[0]
         bin_y_low = self.bin2_pos[1]
@@ -747,7 +745,7 @@ class PickPlace(SingleArmEnv):
 
         Warp branch samples per-env placements via ``sample_batch(k)``
         with ``k = |_reset_env_mask|`` and writes only masked rows. Visual
-        objects are placed via ``sim.model.body_pos`` — under warp this is
+        objects are placed via ``sim.model.body_pos`` -- under warp this is
         a CPU-only mutation that does not propagate to ``_warp_model`` (a
         one-off snapshot at init), but visual objects are cosmetic only
         and don't affect physics.
@@ -777,7 +775,7 @@ class PickPlace(SingleArmEnv):
                     )
                     for obj_pos, obj_quat, obj in placements.values():
                         if "visual" in obj.name.lower():
-                            # Visual-only — no free joint. Skip under warp
+                            # Visual-only -- no free joint. Skip under warp
                             # (model snapshot was taken at init).
                             continue
                         addr = self.sim.model.get_joint_qpos_addr(obj.joints[0])
@@ -863,9 +861,7 @@ class PickPlace(SingleArmEnv):
         # returns True if all objects are in correct bins
         return np.sum(self.objects_in_bins) == len(self.objects)
 
-    # ------------------------------------------------------------------
     # Early-termination hook
-    # ------------------------------------------------------------------
 
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         """Collision objects monitored by the fall-off check.

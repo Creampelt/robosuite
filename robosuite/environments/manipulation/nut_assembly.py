@@ -197,9 +197,7 @@ class NutAssembly(SingleArmEnv):
         fall_off_termination: bool = False,
         fall_off_z_margin: float = 0.1,
     ):
-        # Early-termination when a nut drops below ``table_offset[2] -
-        # fall_off_z_margin``. Gated so BC eval / demo-gen keep the
-        # original (no-termination) semantics.
+        # Gated fall-off termination; BC eval / demo-gen keep no-termination.
         self.fall_off_termination = fall_off_termination
         self.fall_off_z_margin = fall_off_z_margin
 
@@ -270,7 +268,7 @@ class NutAssembly(SingleArmEnv):
         self._check_success()
 
         if isinstance(self.sim, MjSimWarp):
-            # self.objects_on_pegs is (num_envs, n_nuts) bool; sum → per-env
+            # self.objects_on_pegs is (num_envs, n_nuts) bool; sum -> per-env
             # float count of nuts correctly placed.
             reward = self.objects_on_pegs.float().sum(dim=-1)
             if self.reward_scale is not None:
@@ -382,7 +380,7 @@ class NutAssembly(SingleArmEnv):
         Under warp ``obj_pos`` is a ``(num_envs, 3)`` tensor and ``peg_pos``
         is likewise batched, so the result is a ``(num_envs,)`` bool tensor.
         Under CPU ``obj_pos`` is a ``(3,)`` array and the result is a scalar
-        bool — preserving upstream semantics.
+        bool -- preserving upstream semantics.
         """
         peg_body_id = self.peg1_body_id if peg_id == 0 else self.peg2_body_id
         peg_pos = self.sim.data.body_xpos[peg_body_id]
@@ -493,10 +491,8 @@ class NutAssembly(SingleArmEnv):
         # information of objects
         self.object_site_ids = [self.sim.model.site_name2id(nut.important_sites["handle"]) for nut in self.nuts]
 
-        # keep track of which objects are on their corresponding pegs.
-        # Under warp we carry a per-env (num_envs, n_nuts) bool tensor on
-        # device; upstream consumers (e.g. mimicgen env_interfaces) run on
-        # CPU paths and see the 1D numpy layout unchanged.
+        # objects_on_pegs: (num_envs, n_nuts) bool CUDA tensor under warp;
+        # CPU path keeps upstream 1D numpy layout.
         if isinstance(self.sim, MjSimWarp):
             self.objects_on_pegs = torch.zeros(
                 (self.num_envs, len(self.nuts)),
@@ -599,7 +595,7 @@ class NutAssembly(SingleArmEnv):
         @sensor(modality=modality)
         def nut_quat(obs_cache):
             if isinstance(self.sim, MjSimWarp):
-                # (N, 4) wxyz → xyzw via last-axis reorder.
+                # (N, 4) wxyz -> xyzw via last-axis reorder.
                 q = self.sim.data.body_xquat[self.obj_body_id[nut_name]]
                 return q[..., [1, 2, 3, 0]]
             return T.convert_quat(self.sim.data.body_xquat[self.obj_body_id[nut_name]], to="xyzw")
@@ -658,11 +654,8 @@ class NutAssembly(SingleArmEnv):
 
                 assert isinstance(self.sim, MjSimWarp)
 
-                # Scope per-env resets to ``_reset_env_mask`` so kept envs'
-                # nut qpos flows through untouched. A full-batch
-                # ``set_joint_qpos`` would broadcast a single placement to
-                # every env and clobber the kept rows — see the "Masked
-                # qpos writes" working-notes entry.
+                # Mask-scoped writes; full-batch set_joint_qpos tiles row 0 and
+                # clobbers kept envs (see "Masked qpos writes" note).
                 mask = getattr(self, "_reset_env_mask", None)
                 if mask is None:
                     sample_idxs_arr = np.arange(self.num_envs)
@@ -752,9 +745,7 @@ class NutAssembly(SingleArmEnv):
         # returns True if all objects are on correct pegs
         return np.sum(self.objects_on_pegs) == len(self.nuts)
 
-    # ------------------------------------------------------------------
     # Early-termination hook
-    # ------------------------------------------------------------------
 
     def _fall_off_tracked_objects(self) -> tuple[str, ...]:
         """Nut names monitored by the fall-off check."""

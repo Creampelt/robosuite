@@ -4,9 +4,15 @@ Utility functions of matrix and vector transformations.
 NOTE: convention for quaternions is (x, y, z, w)
 """
 
+from __future__ import annotations
+
 import math
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
 
 from robosuite.utils.numba import jit_decorator
 
@@ -929,15 +935,12 @@ def matrix_inverse(matrix):
     return np.linalg.inv(matrix)
 
 
-# ---------------------------------------------------------------------------
-# Batched torch pose utilities (for MuJoCo Warp / GPU paths)
-# All functions operate on CUDA torch tensors with a leading batch dimension.
-# Quaternion convention: xyzw (same as the rest of this file).
-# ---------------------------------------------------------------------------
+# Batched torch pose utilities (MuJoCo Warp / GPU paths). CUDA tensors with
+# leading batch dim; quaternion convention xyzw (as in the rest of this file).
 
 
-def quat2mat_torch(q: "torch.Tensor") -> "torch.Tensor":
-    """Batched xyzw quaternion → rotation matrix.
+def quat2mat_torch(q: torch.Tensor) -> torch.Tensor:
+    """Batched xyzw quaternion -> rotation matrix.
 
     Args:
         q: ``(N, 4)`` float tensor, xyzw convention.
@@ -954,8 +957,8 @@ def quat2mat_torch(q: "torch.Tensor") -> "torch.Tensor":
     ], dim=-1).reshape(*q.shape[:-1], 3, 3)
 
 
-def mat2quat_torch(R: "torch.Tensor") -> "torch.Tensor":
-    """Batched rotation matrix → xyzw quaternion (vectorised Shepperd's method).
+def mat2quat_torch(R: torch.Tensor) -> torch.Tensor:
+    """Batched rotation matrix -> xyzw quaternion (vectorised Shepperd's method).
 
     Args:
         R: ``(N, 3, 3)`` rotation matrix tensor.
@@ -992,7 +995,7 @@ def mat2quat_torch(R: "torch.Tensor") -> "torch.Tensor":
     return torch.where(c0, q0, torch.where(c1, q1, torch.where(c2, q2, q3)))
 
 
-def make_pose_torch(pos: "torch.Tensor", rot: "torch.Tensor") -> "torch.Tensor":
+def make_pose_torch(pos: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
     """Assemble a batched SE(3) homogeneous matrix from position and rotation.
 
     Args:
@@ -1010,8 +1013,8 @@ def make_pose_torch(pos: "torch.Tensor", rot: "torch.Tensor") -> "torch.Tensor":
     return mat
 
 
-def pose2mat_torch(pos: "torch.Tensor", quat_xyzw: "torch.Tensor") -> "torch.Tensor":
-    """Batched (pos, quat) → 4×4 SE(3) matrix.
+def pose2mat_torch(pos: torch.Tensor, quat_xyzw: torch.Tensor) -> torch.Tensor:
+    """Batched (pos, quat) -> 4x4 SE(3) matrix.
 
     Args:
         pos: ``(N, 3)`` translation tensor.
@@ -1023,7 +1026,7 @@ def pose2mat_torch(pos: "torch.Tensor", quat_xyzw: "torch.Tensor") -> "torch.Ten
     return make_pose_torch(pos, quat2mat_torch(quat_xyzw))
 
 
-def pose_inv_torch(mat: "torch.Tensor") -> "torch.Tensor":
+def pose_inv_torch(mat: torch.Tensor) -> torch.Tensor:
     """Batched SE(3) matrix inverse.
 
     For a rigid-body transform ``[[R, t], [0, 1]]`` the inverse is
@@ -1041,8 +1044,8 @@ def pose_inv_torch(mat: "torch.Tensor") -> "torch.Tensor":
     return make_pose_torch(-(R_T @ t.unsqueeze(-1)).squeeze(-1), R_T)
 
 
-def axisangle2quat_torch(vec: "torch.Tensor") -> "torch.Tensor":
-    """Batched axis-angle → quaternion (xyzw convention).
+def axisangle2quat_torch(vec: torch.Tensor) -> torch.Tensor:
+    """Batched axis-angle -> quaternion (xyzw convention).
 
     Args:
         vec: ``(N, 3)`` axis-angle tensor where ``||vec||`` is the rotation angle.
@@ -1056,7 +1059,7 @@ def axisangle2quat_torch(vec: "torch.Tensor") -> "torch.Tensor":
     axis = vec / safe_angle                                  # (N, 3)
     half = angle / 2.0
     quat = torch.cat([axis * torch.sin(half), torch.cos(half)], dim=-1)  # (N, 4) xyzw
-    # When angle ≈ 0 return identity quaternion (0, 0, 0, 1)
+    # When angle ~= 0 return identity quaternion (0, 0, 0, 1)
     identity = torch.zeros_like(quat)
     identity[..., -1] = 1.0
     return torch.where(angle.expand_as(quat) > 1e-9, quat, identity)
