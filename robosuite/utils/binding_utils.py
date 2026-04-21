@@ -1784,6 +1784,16 @@ class MjSimWarp(MjSim):
         # Shared model wrapper — identical for every env
         self.model = MjModelWarp(model)
 
+        # Force dense constraint Jacobian + qM layout under warp. With the
+        # default mjJAC_AUTO, mujoco-warp switches to sparse at nv>32 and
+        # emits qM as (nworld, 1, nM) instead of (nworld, nv, nv). The OSC
+        # controller's mass-matrix extraction (base_controller.py) assumes
+        # dense layout; sparse layout trips a CUDA OOB on qvel_index
+        # indexing. PickPlace has nv=33 and was the first task to hit this.
+        import mujoco as _mj
+        if model.opt.jacobian == int(_mj.mjtJacobian.mjJAC_AUTO):
+            model.opt.jacobian = int(_mj.mjtJacobian.mjJAC_DENSE)
+
         # Warp model: increase CCD iterations to avoid solver warnings under
         # parallel load (the default of 35 is too low for multi-env rollouts).
         self._warp_model = mjwarp.put_model(model)
