@@ -1,7 +1,10 @@
 """
 Gripper with two fingers for Rethink Robots.
 """
+from __future__ import annotations
+
 import numpy as np
+import torch
 
 from robosuite.models.grippers.gripper_model import GripperModel
 from robosuite.utils.mjcf_utils import xml_path_completion
@@ -40,21 +43,34 @@ class RethinkGripper(RethinkGripperBase):
     Modifies two finger base to only take one action.
     """
 
-    def format_action(self, action):
+    def format_action(self, action: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
         """
         Maps continuous action into binary output
         -1 => open, 1 => closed
 
         Args:
-            action (np.array): gripper-specific action
+            action: gripper-specific action, shape (dof,), (num_envs, dof) numpy or torch tensor
 
         Raises:
             AssertionError: [Invalid action dimension size]
         """
-        assert len(action) == 1
-        self.current_action = np.clip(
-            self.current_action + np.array([1.0, -1.0]) * self.speed * np.sign(action), -1.0, 1.0
-        )
+        assert action.shape[-1] == self.dof
+        if isinstance(action, torch.Tensor):
+            dev, dtype = action.device, action.dtype
+            if not isinstance(self.current_action, torch.Tensor):
+                self.current_action = torch.as_tensor(self.current_action, device=dev, dtype=dtype)
+            if action.ndim == 2 and self.current_action.ndim == 1:
+                self.current_action = self.current_action.unsqueeze(0).expand(action.shape[0], -1).clone()
+            scale = torch.tensor([1.0, -1.0], device=dev, dtype=dtype)
+            self.current_action = torch.clamp(
+                self.current_action + scale * self.speed * torch.sign(action), -1.0, 1.0
+            )
+        else:
+            if action.ndim == 2 and self.current_action.ndim == 1:
+                self.current_action = np.tile(self.current_action, (action.shape[0], 1))
+            self.current_action = np.clip(
+                self.current_action + np.array([1.0, -1.0]) * self.speed * np.sign(action), -1.0, 1.0
+            )
         return self.current_action
 
     @property

@@ -13,8 +13,8 @@
         <!-- base material and mesh -->
 	<material name="Mtl1.017" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
 	<material name="Mtl2.017" specular="0.5" shininess="0.225" rgba="0.286275 0.286275 0.286275 1.000000"/>
-	<mesh name="base_0" file="obj_meshes/base/base_0.obj"/>
-	<mesh name="base_1" file="obj_meshes/base/base_1.obj"/>
+	<mesh name="base_0" file="obj_meshes/base/base_0.obj" inertia="shell"/>
+	<mesh name="base_1" file="obj_meshes/base/base_1.obj" inertia="shell"/>
       
         <!-- head material and mesh -->
 	<material name="Mtl1" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
@@ -27,16 +27,16 @@
 	<material name="Mtl9" specular="0.5" shininess="0.225" rgba="0.250980 0.250980 0.250980 1.000000"/>
 	<material name="Mtla" specular="0.5" shininess="0.225" rgba="0.000000 0.000000 1.000000 1.000000"/>
 	<material name="Mtlb" specular="0.5" shininess="0.225" rgba="0.290196 0.290196 0.290196 1.000000"/>
-	<mesh name="head_0" file="obj_meshes/head/head_0.obj"/>
-	<mesh name="head_1" file="obj_meshes/head/head_1.obj"/>
-	<mesh name="head_2" file="obj_meshes/head/head_2.obj"/>
-	<mesh name="head_3" file="obj_meshes/head/head_3.obj"/>
-	<mesh name="head_4" file="obj_meshes/head/head_4.obj"/>
-	<mesh name="head_5" file="obj_meshes/head/head_5.obj"/>
-	<mesh name="head_6" file="obj_meshes/head/head_6.obj"/>
-	<mesh name="head_7" file="obj_meshes/head/head_7.obj"/>
-	<mesh name="head_8" file="obj_meshes/head/head_8.obj"/>
-	<mesh name="head_9" file="obj_meshes/head/head_9.obj"/>
+	<mesh name="head_0" file="obj_meshes/head/head_0.obj" inertia="shell"/>
+	<mesh name="head_1" file="obj_meshes/head/head_1.obj" inertia="shell"/>
+	<mesh name="head_2" file="obj_meshes/head/head_2.obj" inertia="shell"/>
+	<mesh name="head_3" file="obj_meshes/head/head_3.obj" inertia="shell"/>
+	<mesh name="head_4" file="obj_meshes/head/head_4.obj" inertia="shell"/>
+	<mesh name="head_5" file="obj_meshes/head/head_5.obj" inertia="shell"/>
+	<mesh name="head_6" file="obj_meshes/head/head_6.obj" inertia="shell"/>
+	<mesh name="head_7" file="obj_meshes/head/head_7.obj" inertia="shell"/>
+	<mesh name="head_8" file="obj_meshes/head/head_8.obj" inertia="shell"/>
+	<mesh name="head_9" file="obj_meshes/head/head_9.obj" inertia="shell"/>
 
         <!-- l0 material and mesh -->
 	<material name="Mtl1.014" specular="0.5" shininess="0.225" rgba="0.286275 0.286275 0.286275 1.000000"/>
@@ -46,21 +46,21 @@
 	<material name="Mtl5.010" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
 	<material name="Mtl6.008" specular="0.5" shininess="0.225" rgba="0.792157 0.819608 0.929412 1.000000"/>
 	<material name="Mtl7.007" specular="0.5" shininess="0.225" rgba="0.250980 0.250980 0.250980 1.000000"/>
-	<mesh name="l0_0" file="obj_meshes/l0/l0_0.obj"/>
-	<mesh name="l0_1" file="obj_meshes/l0/l0_1.obj"/>
-	<mesh name="l0_2" file="obj_meshes/l0/l0_2.obj"/>
-	<mesh name="l0_3" file="obj_meshes/l0/l0_3.obj"/>
-	<mesh name="l0_4" file="obj_meshes/l0/l0_4.obj"/>
-	<mesh name="l0_5" file="obj_meshes/l0/l0_5.obj"/>
-	<mesh name="l0_6" file="obj_meshes/l0/l0_6.obj"/>
+	<mesh name="l0_0" file="obj_meshes/l0/l0_0.obj" inertia="shell"/>
+	<mesh name="l0_1" file="obj_meshes/l0/l0_1.obj" inertia="shell"/>
+	<mesh name="l0_2" file="obj_meshes/l0/l0_2.obj" inertia="shell"/>
+	<mesh name="l0_3" file="obj_meshes/l0/l0_3.obj" inertia="shell"/>
+	<mesh name="l0_4" file="obj_meshes/l0/l0_4.obj" inertia="shell"/>
+	<mesh name="l0_5" file="obj_meshes/l0/l0_5.obj" inertia="shell"/>
+	<mesh name="l0_6" file="obj_meshes/l0/l0_6.obj" inertia="shell"/>
 
         <!-- l1 material and mesh -->
 	<material name="Mtl1.004" specular="0.5" shininess="0.225" rgba="1.000000 1.000000 1.000000 1.000000"/>
 	<material name="Mtl2.004" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
 	<material name="Mtl3.003" specular="0.5" shininess="0.225" rgba="0.286275 0.286275 0.286275 1.000000"/>
-	<mesh name="l1_0" file="obj_meshes/l1/l1_0.obj"/>
-	<mesh name="l1_1" file="obj_meshes/l1/l1_1.obj"/>
-	<mesh name="l1_2" file="obj_meshes/l1/l1_2.obj"/>
+	<mesh name="l1_0" file="obj_meshes/l1/l1_0.obj" inertia="shell"/>
+	<mesh name="l1_1" file="obj_meshes/l1/l1_1.obj" inertia="shell"/>
+	<mesh name="l1_2" file="obj_meshes/l1/l1_2.obj" inertia="shell"/>
 
         <!-- l2 material and mesh -->
 	<material name="Mtl1.005" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
@@ -68,21 +68,21 @@
 	<material name="Mtl3.004" specular="0.5" shininess="0.225" rgba="1.000000 1.000000 1.000000 1.000000"/>
 	<material name="Mtl4.003" specular="0.5" shininess="0.225" rgba="0.792157 0.819608 0.929412 1.000000"/>
 	<material name="Mtl5.003" specular="0.5" shininess="0.225" rgba="0.105882 0.105882 0.105882 1.000000"/>
-	<mesh name="l2_0" file="obj_meshes/l2/l2_0.obj"/>
-	<mesh name="l2_1" file="obj_meshes/l2/l2_1.obj"/>
-	<mesh name="l2_2" file="obj_meshes/l2/l2_2.obj"/>
-	<mesh name="l2_3" file="obj_meshes/l2/l2_3.obj"/>
-	<mesh name="l2_4" file="obj_meshes/l2/l2_4.obj"/>
+	<mesh name="l2_0" file="obj_meshes/l2/l2_0.obj" inertia="shell"/>
+	<mesh name="l2_1" file="obj_meshes/l2/l2_1.obj" inertia="shell"/>
+	<mesh name="l2_2" file="obj_meshes/l2/l2_2.obj" inertia="shell"/>
+	<mesh name="l2_3" file="obj_meshes/l2/l2_3.obj" inertia="shell"/>
+	<mesh name="l2_4" file="obj_meshes/l2/l2_4.obj" inertia="shell"/>
 
         <!-- l3 material and mesh -->
 	<material name="Mtl1.007" specular="0.5" shininess="0.225" rgba="0.290196 0.290196 0.290196 1.000000"/>
 	<material name="Mtl2.007" specular="0.5" shininess="0.225" rgba="1.000000 1.000000 1.000000 1.000000"/>
 	<material name="Mtl3.006" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
 	<material name="Mtl4.005" specular="0.5" shininess="0.225" rgba="0.792157 0.819608 0.929412 1.000000"/>
-	<mesh name="l3_0" file="obj_meshes/l3/l3_0.obj"/>
-	<mesh name="l3_1" file="obj_meshes/l3/l3_1.obj"/>
-	<mesh name="l3_2" file="obj_meshes/l3/l3_2.obj"/>
-	<mesh name="l3_3" file="obj_meshes/l3/l3_3.obj"/>
+	<mesh name="l3_0" file="obj_meshes/l3/l3_0.obj" inertia="shell"/>
+	<mesh name="l3_1" file="obj_meshes/l3/l3_1.obj" inertia="shell"/>
+	<mesh name="l3_2" file="obj_meshes/l3/l3_2.obj" inertia="shell"/>
+	<mesh name="l3_3" file="obj_meshes/l3/l3_3.obj" inertia="shell"/>
 
         <!-- l4 material and mesh -->
 	<material name="Mtl1.010" specular="0.5" shininess="0.225" rgba="0.286275 0.286275 0.286275 1.000000"/>
@@ -93,14 +93,14 @@
 	<material name="Mtl6.004" specular="0.5" shininess="0.225" rgba="0.749020 0.749020 0.749020 1.000000"/>
 	<material name="Mtl7.004" specular="0.5" shininess="0.225" rgba="0.290196 0.290196 0.290196 1.000000"/>
 	<material name="Mtl8.002" specular="0.5" shininess="0.225" rgba="0.250980 0.250980 0.250980 1.000000"/>
-	<mesh name="l4_0" file="obj_meshes/l4/l4_0.obj"/>
-	<mesh name="l4_1" file="obj_meshes/l4/l4_1.obj"/>
-	<mesh name="l4_2" file="obj_meshes/l4/l4_2.obj"/>
-	<mesh name="l4_3" file="obj_meshes/l4/l4_3.obj"/>
-	<mesh name="l4_4" file="obj_meshes/l4/l4_4.obj"/>
-	<mesh name="l4_5" file="obj_meshes/l4/l4_5.obj"/>
-	<mesh name="l4_6" file="obj_meshes/l4/l4_6.obj"/>
-	<mesh name="l4_7" file="obj_meshes/l4/l4_7.obj"/>
+	<mesh name="l4_0" file="obj_meshes/l4/l4_0.obj" inertia="shell"/>
+	<mesh name="l4_1" file="obj_meshes/l4/l4_1.obj" inertia="shell"/>
+	<mesh name="l4_2" file="obj_meshes/l4/l4_2.obj" inertia="shell"/>
+	<mesh name="l4_3" file="obj_meshes/l4/l4_3.obj" inertia="shell"/>
+	<mesh name="l4_4" file="obj_meshes/l4/l4_4.obj" inertia="shell"/>
+	<mesh name="l4_5" file="obj_meshes/l4/l4_5.obj" inertia="shell"/>
+	<mesh name="l4_6" file="obj_meshes/l4/l4_6.obj" inertia="shell"/>
+	<mesh name="l4_7" file="obj_meshes/l4/l4_7.obj" inertia="shell"/>
 
         <!-- l5 material and mesh -->
 	<material name="Mtl1_001" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
@@ -108,11 +108,11 @@
 	<material name="Mtl3_001" specular="0.5" shininess="0.225" rgba="0.286275 0.286275 0.286275 1.000000"/>
 	<material name="Mtl4_001" specular="0.5" shininess="0.225" rgba="0.866667 0.905882 1.000000 1.000000"/>
 	<material name="Mtl5_001" specular="0.5" shininess="0.225" rgba="0.501961 0.501961 0.501961 1.000000"/>
-	<mesh name="l5_0" file="obj_meshes/l5/l5_0.obj"/>
-	<mesh name="l5_1" file="obj_meshes/l5/l5_1.obj"/>
-	<mesh name="l5_2" file="obj_meshes/l5/l5_2.obj"/>
-	<mesh name="l5_3" file="obj_meshes/l5/l5_3.obj"/>
-	<mesh name="l5_4" file="obj_meshes/l5/l5_4.obj"/>
+	<mesh name="l5_0" file="obj_meshes/l5/l5_0.obj" inertia="shell"/>
+	<mesh name="l5_1" file="obj_meshes/l5/l5_1.obj" inertia="shell"/>
+	<mesh name="l5_2" file="obj_meshes/l5/l5_2.obj" inertia="shell"/>
+	<mesh name="l5_3" file="obj_meshes/l5/l5_3.obj" inertia="shell"/>
+	<mesh name="l5_4" file="obj_meshes/l5/l5_4.obj" inertia="shell"/>
 
         <!-- l6 material and mesh -->
 	<material name="Mtl1.012" specular="0.5" shininess="0.225" rgba="0.298039 0.298039 0.298039 1.000000"/>
@@ -121,12 +121,12 @@
 	<material name="Mtl4.010" specular="0.5" shininess="0.225" rgba="1.000000 0.000000 0.000000 1.000000"/>
 	<material name="Mtl5.008" specular="0.5" shininess="0.225" rgba="1.000000 1.000000 1.000000 1.000000"/>
 	<material name="Mtl6.006" specular="0.5" shininess="0.225" rgba="1.000000 0.403922 0.121569 1.000000"/>
-	<mesh name="l6_0" file="obj_meshes/l6/l6_0.obj"/>
-	<mesh name="l6_1" file="obj_meshes/l6/l6_1.obj"/>
-	<mesh name="l6_2" file="obj_meshes/l6/l6_2.obj"/>
-	<mesh name="l6_3" file="obj_meshes/l6/l6_3.obj"/>
-	<mesh name="l6_4" file="obj_meshes/l6/l6_4.obj"/>
-	<mesh name="l6_5" file="obj_meshes/l6/l6_5.obj"/>
+	<mesh name="l6_0" file="obj_meshes/l6/l6_0.obj" inertia="shell"/>
+	<mesh name="l6_1" file="obj_meshes/l6/l6_1.obj" inertia="shell"/>
+	<mesh name="l6_2" file="obj_meshes/l6/l6_2.obj" inertia="shell"/>
+	<mesh name="l6_3" file="obj_meshes/l6/l6_3.obj" inertia="shell"/>
+	<mesh name="l6_4" file="obj_meshes/l6/l6_4.obj" inertia="shell"/>
+	<mesh name="l6_5" file="obj_meshes/l6/l6_5.obj" inertia="shell"/>
 
     </asset>
     <worldbody>
