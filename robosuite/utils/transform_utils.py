@@ -992,7 +992,13 @@ def mat2quat_torch(R: torch.Tensor) -> torch.Tensor:
     c0 = (trace > 0)[..., None]
     c1 = m00_largest[..., None]
     c2 = m11_largest[..., None]
-    return torch.where(c0, q0, torch.where(c1, q1, torch.where(c2, q2, q3)))
+    q = torch.where(c0, q0, torch.where(c1, q1, torch.where(c2, q2, q3)))
+    # Match numpy mat2quat convention: enforce w >= 0. Downstream consumers
+    # (BC policies trained on CPU-rollout data) see positive-w quats only;
+    # the q/-q ambiguity flips obj_to_eef_quat on a subset of poses and
+    # silently drives BC eval SR to ~0 under warp.
+    w_neg = q[..., 3:4] < 0
+    return torch.where(w_neg, -q, q)
 
 
 def make_pose_torch(pos: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
